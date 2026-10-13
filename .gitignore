@@ -1,0 +1,17 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+.coverage
+htmlcov/
+.env
+.env.*
+.ipynb_checkpoints/
+/data/*
+!/data/samples/
+/data/samples/*
+!/data/samples/sales.csv
