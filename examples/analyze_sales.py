@@ -1,4 +1,4 @@
-"""Run the Phase 0 tools on synthetic data or a user-specified CSV."""
+"""使用 Phase 0 工具分析模拟数据或用户指定的 CSV。"""
 
 import argparse
 import json
@@ -14,7 +14,7 @@ from data_copilot.data_loader import dataset_overview, load_csv
 
 
 def main() -> None:
-    """Print a JSON report; the CSV must have region/sales/advertising_spend."""
+    """输出 JSON 报告；CSV 必须包含 region、sales 和 advertising_spend 列。"""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "csv_path",

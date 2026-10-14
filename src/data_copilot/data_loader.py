@@ -1,4 +1,4 @@
-"""Strict CSV loading and JSON-compatible dataset overview."""
+"""严格校验并读取 CSV，生成兼容 JSON 的数据集概览。"""
 
 import csv
 import math
@@ -12,11 +12,11 @@ import pandas as pd
 
 
 class CSVValidationError(ValueError):
-    """The input is empty, malformed, or has an invalid header."""
+    """输入文件为空、格式错误或表头无效时抛出的异常。"""
 
 
 def _json_value(value: Any) -> Any:
-    """Convert scalar/container values without rounding finite numeric values."""
+    """将标量或容器中的值转换为 JSON 兼容类型，不对有限数值舍入。"""
     if isinstance(value, dict):
         return {str(key): _json_value(item) for key, item in value.items()}
     if isinstance(value, (list, tuple)):
@@ -39,7 +39,7 @@ def _json_value(value: Any) -> Any:
 
 
 def _validate_frame(dataframe: pd.DataFrame) -> None:
-    """Require unique nonblank string columns for stable JSON/tool parameters."""
+    """要求列名为唯一且非空白的字符串，确保 JSON 字段和工具参数稳定。"""
     if not isinstance(dataframe, pd.DataFrame):
         raise TypeError("dataframe must be a pandas DataFrame")
     names = list(dataframe.columns)
@@ -50,10 +50,10 @@ def _validate_frame(dataframe: pd.DataFrame) -> None:
 
 
 def load_csv(file_path: str | Path, *, encoding: str = "utf-8-sig") -> pd.DataFrame:
-    """Read a comma-separated CSV; reject invalid headers and ragged rows.
+    """读取逗号分隔的 CSV，拒绝无效表头及字段数量不一致的记录。
 
-    Encoding errors and OS errors propagate. No encoding detection or cleaning
-    is performed. pandas infers dtypes and uses its standard missing markers.
+    编码错误和操作系统错误直接向调用方抛出，不自动检测编码或清洗数据。
+    由 Pandas 推断数据类型，并使用其默认的缺失值标记。
     """
     path = Path(file_path)
     if not path.exists():
@@ -89,7 +89,7 @@ def load_csv(file_path: str | Path, *, encoding: str = "utf-8-sig") -> pd.DataFr
 
 
 def dataset_info(dataframe: pd.DataFrame) -> dict[str, Any]:
-    """Return row/column counts, names, dtypes, and missing counts as JSON values."""
+    """返回兼容 JSON 的行列数、列名、数据类型和各列缺失值数量。"""
     _validate_frame(dataframe)
     return {
         "row_count": int(len(dataframe)),
@@ -105,7 +105,7 @@ def dataset_info(dataframe: pd.DataFrame) -> dict[str, Any]:
 def dataset_overview(
     dataframe: pd.DataFrame, *, preview_rows: int = 5
 ) -> dict[str, Any]:
-    """Add a record-oriented preview; timestamps use ISO strings, nonfinite null."""
+    """添加按行组织的预览；时间戳转为 ISO 字符串，非有限数值转为 null。"""
     if isinstance(preview_rows, bool) or not isinstance(preview_rows, int):
         raise TypeError("preview_rows must be an integer")
     if preview_rows < 0:

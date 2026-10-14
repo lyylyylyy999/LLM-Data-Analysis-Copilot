@@ -1,4 +1,4 @@
-"""Explicit, non-mutating statistical tools with standard JSON results."""
+"""参数显式传入、不修改输入数据且返回标准 JSON 兼容结果的统计工具。"""
 
 from collections.abc import Sequence
 from typing import Any
@@ -38,10 +38,10 @@ def _require_numeric(dataframe: pd.DataFrame, column: str) -> None:
 def describe_numeric(
     dataframe: pd.DataFrame, columns: str | Sequence[str]
 ) -> dict[str, Any]:
-    """Describe selected real numeric columns; skip missing values, std ddof=1.
+    """对选定的实数数值列计算描述统计，跳过缺失值，标准差使用 ddof=1。
 
-    Undefined or overflowed statistics become null, with their names listed
-    in unavailable_statistics. No string-to-number coercion is performed.
+    无法计算或溢出的统计量返回 null，并将名称列入 unavailable_statistics。
+    不自动将字符串转换为数字。
     """
     if not isinstance(columns, (str, Sequence)) or isinstance(columns, bytes):
         raise TypeError("columns must be a column name or a sequence of names")
@@ -70,11 +70,10 @@ def group_aggregate(
     target_column: str,
     aggregation: str = "mean",
 ) -> dict[str, Any]:
-    """Aggregate real numeric values; keep missing keys as null, in first-seen order.
+    """对实数数值列分组聚合，保留缺失分组键为 null，按首次出现顺序返回。
 
-    count counts nonmissing targets. sum uses min_count=1, so all-missing
-    groups return null rather than a misleading zero. Only observed groups
-    are returned, including for categorical columns.
+    count 只统计目标列的非缺失值。sum 使用 min_count=1，使全缺失组返回 null，
+    避免被误解为零。仅返回实际出现的分组，分类类型的分组列也遵循此规则。
     """
     if not isinstance(aggregation, str):
         raise TypeError("aggregation must be a string")
@@ -112,10 +111,10 @@ def correlation(
     y_column: str,
     method: str = "pearson",
 ) -> dict[str, Any]:
-    """Pearson correlation with pairwise missing removal; never implies causation.
+    """计算 Pearson 相关系数，仅使用两列均非缺失的样本；相关关系不代表因果。
 
-    Fewer than two complete pairs or a constant variable yields null with
-    an explicit status. Infinite inputs are rejected, not silently dropped.
+    有效样本对少于两对，或任一变量为常量时，返回 null 和明确状态。
+    输入包含无穷值时直接报错，不静默删除这些值。
     """
     if not isinstance(method, str):
         raise TypeError("method must be a string")
