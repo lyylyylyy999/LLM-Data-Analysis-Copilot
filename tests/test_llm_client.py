@@ -88,7 +88,11 @@ def test_streaming_answer_and_usage(offline_client, capsys):
     )
     request = offline_client.create.call_args.kwargs
     assert request["model"] == "configured-model"
-    assert request["messages"] == [{"role": "user", "content": "请解释均值"}]
+    assert llm_client.SYSTEM_PROMPT.strip()
+    assert request["messages"] == [
+        {"role": "system", "content": llm_client.SYSTEM_PROMPT},
+        {"role": "user", "content": "请解释均值"},
+    ]
     assert request["stream"] is True
     assert request["stream_options"] == {"include_usage": True}
 
@@ -132,6 +136,7 @@ def test_missing_usage(offline_client):
     assert result["answer"] == "answer"
     assert json.loads(json.dumps(result, allow_nan=False))["usage"] is None
     assert offline_client.create.call_args.kwargs["messages"] == [
+        {"role": "system", "content": llm_client.SYSTEM_PROMPT},
         {"role": "user", "content": "another question"},
     ]
 
@@ -234,3 +239,30 @@ def test_example_delegates_and_displays_only_result(monkeypatch, capsys):
     output = capsys.readouterr()
     assert json.loads(output.out) == result
     assert output.err == ""
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "什么是过拟合？请用一个简单例子解释。",
+        "销售额和广告投入正相关，能证明广告提高了销售额吗？",
+        "请告诉我这份数据的平均销售额。",
+    ],
+)
+def test_system_rules_and_question_are_separate(offline_client, monkeypatch, question):
+    """Verify message construction only; fake answers cannot evaluate the prompt."""
+    rules = "测试系统规则：使用中文回答，不编造统计结果。"
+    monkeypatch.setattr(llm_client, "SYSTEM_PROMPT", rules)
+    set_response(offline_client, [chunk("模拟正文", "stop")])
+    result = llm_client.ask_llm(question)
+    offline_client.create.assert_called_once()
+    assert offline_client.create.call_args.kwargs["messages"] == [
+        {"role": "system", "content": rules},
+        {"role": "user", "content": question},
+    ]
+    assert result == {
+        "answer": "模拟正文",
+        "model": "actual-model",
+        "finish_reason": "stop",
+        "usage": None,
+    }

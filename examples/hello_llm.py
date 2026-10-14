@@ -4,7 +4,7 @@ from data_copilot.llm_client import ask_llm
 
 
 def main() -> None:
-    question = "什么是过拟合"
+    question = "请告诉我这份数据的平均销售额。"
 
     result = ask_llm(question)
 
