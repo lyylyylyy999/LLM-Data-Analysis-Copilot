@@ -222,9 +222,14 @@ def test_import_does_not_load_config_or_create_client(monkeypatch):
     dotenv.assert_not_called()
 
 
-def test_example_delegates_and_displays_only_result(monkeypatch, capsys):
+def test_example_delegates_and_displays_parsed_answer(monkeypatch, capsys):
+    parsed = {
+        "summary": "测试回复",
+        "explanation": "测试解释",
+        "missing_information": [],
+    }
     result = {
-        "answer": "测试回复",
+        "answer": json.dumps(parsed, ensure_ascii=False),
         "model": "actual-model",
         "finish_reason": "stop",
         "usage": None,
@@ -237,8 +242,20 @@ def test_example_delegates_and_displays_only_result(monkeypatch, capsys):
     question = ask.call_args.args[0]
     assert isinstance(question, str) and question.strip()
     output = capsys.readouterr()
-    assert json.loads(output.out) == result
+    assert json.loads(output.out) == parsed
     assert output.err == ""
+
+
+def test_example_does_not_hide_json_failure(monkeypatch, capsys):
+    monkeypatch.setattr(
+        llm_client, "ask_llm", Mock(return_value={"answer": "not JSON"})
+    )
+    path = Path(__file__).resolve().parents[1] / "examples/hello_llm.py"
+    with pytest.raises(json.JSONDecodeError) as caught:
+        runpy.run_path(str(path), run_name="__main__")
+    assert caught.value.doc == "not JSON"
+    output = capsys.readouterr()
+    assert output.out == output.err == ""
 
 
 @pytest.mark.parametrize(
