@@ -34,7 +34,7 @@ llm-data-analysis-copilot/
 
 ```powershell
 conda activate LLM
-python -m pip install -e ".[dev]"
+python -m pip install -e ".[dev,llm]"
 python -m pytest -q
 python -m ruff check .
 python -m ruff format --check .
