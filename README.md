@@ -2,28 +2,43 @@
 
 面向 CSV 数据的智能分析助手学习项目。最终目标是：用户上传数据、用自然语言提出问题，LLM 选择 Python/Pandas 工具执行真实计算，再根据结果生成可读的分析报告。
 
-当前仅完成 **Phase 0**：工程配置、CSV 读取与校验、数据概览、描述统计、分组聚合、Pearson 相关性和离线测试。LLM API、Prompt、Structured Outputs、Function Calling、Agent、RAG、FastAPI 与 Streamlit 均未实现。后续任务见 [TASKS.md](TASKS.md)。
+当前已完成基础统计模块、单次 LLM 流式调用、system 提示词、JSON 解析校验、Pydantic 回答模型，以及 SDK `parse()` 的接口级结构化输出实验。学习任务 01～06C 的代码已实现并通过离线审查。
+
+**当前尚未将 CSV 统计结果交给模型解释**，这将是学习任务 07。Function Calling、Agent、FastAPI、Streamlit、评估系统与 RAG 均未实现。阶段状态和待确认事项见 [TASKS.md](TASKS.md)。
+
+LLM 核心代码由学习者独立实现，Codex 负责基础工程、答疑、审查和测试；只有明确授权时才修改学习代码。
 
 ## 技术栈和结构
 
-Python 3.11+、conda 的 `LLM` 环境、Pandas；pytest 用于测试，Ruff 用于格式与静态规范检查。运行依赖为 Pandas 和其数值基础 NumPy；NumPy 同时用于数值类型与有限值校验。
+Python 3.11+，统一使用 conda 的 `LLM` 环境。Pandas/NumPy 负责真实统计计算；OpenAI Python SDK 调用 DashScope 兼容接口；python-dotenv 读取配置；Pydantic v2 负责本地结构校验。pytest、Ruff、mypy/pandas-stubs 分别用于离线测试、代码规范和类型检查。使用 OpenAI SDK 不代表请求发往 OpenAI，实际服务由 `DASHSCOPE_BASE_URL` 决定。
 
 ```text
 llm-data-analysis-copilot/
 ├── src/data_copilot/
 │   ├── __init__.py
-│   ├── data_loader.py       # CSV 校验、读取、JSON 数据概览
-│   └── analysis_tools.py    # 四类统计工具
+│   ├── data_loader.py       # CSV 校验、读取、概览
+│   ├── analysis_tools.py    # 四类统计工具
+│   ├── llm_client.py        # 流式调用与 SYSTEM_PROMPT
+│   ├── response_parser.py   # 手写 JSON 字段校验
+│   └── schemas.py           # Pydantic AnalysisAnswer
+├── examples/
+│   ├── analyze_sales.py     # 纯统计，无 API 请求
+│   ├── hello_llm.py         # 流式调用后手写解析
+│   ├── pydantic_validation.py # 纯本地校验实验
+│   └── structured_output.py # SDK parse() 非流式实验
 ├── tests/
 │   ├── test_data_loader.py
-│   └── test_analysis_tools.py
+│   ├── test_analysis_tools.py
+│   ├── test_llm_client.py
+│   ├── test_response_parser.py
+│   ├── test_schemas.py
+│   └── test_structured_output.py
 ├── data/samples/sales.csv
 ├── frontend/.gitkeep
 ├── docs/HANDOFF.md
 ├── .gitignore
+├── AGENTS.md
 ├── pyproject.toml
-├── AGENTS.md               # 后续开发约定
-├── examples/analyze_sales.py # 可运行示例
 ├── README.md
 └── TASKS.md
 ```
@@ -42,7 +57,7 @@ python -m ruff format --check .
 python examples/analyze_sales.py
 ```
 
-包以 editable 方式安装；无需手工调整 PYTHONPATH。`pyproject.toml` 是运行和开发依赖的唯一声明来源，conda 管理 Python 环境，环境内的 pip 安装项目包。已有环境按上面的安装命令补齐依赖，不升级其 Python 或导入其他项目的全部依赖。
+包以 editable 方式安装；无需手工调整 PYTHONPATH。`pyproject.toml` 是运行和开发依赖的唯一声明来源，conda 管理 Python 环境，环境内的 pip 安装项目包。pip 会按照 pyproject 中的版本约束解析依赖，因此可能调整已有包的版本；项目安装命令不切换 Python 解释器。完整测试需要同时安装 dev 和 llm extras，即使不发送真实 API 请求也需要 SDK 与 Pydantic。
 
 新机器尚无 `LLM` 环境时，执行 `conda create -n LLM python=3.12 pip`，再激活环境并按上面的命令安装项目。依赖以 pyproject.toml 为准，约束范围内的安装版本可能不同。
 
@@ -54,6 +69,52 @@ conda run --no-capture-output -n LLM python examples/analyze_sales.py
 ```
 
 pytest 临时文件固定放在项目内的 `.pytest_cache/tmp`（每次测试会重建这个专用目录），避免系统临时目录权限问题。VS Code 请通过“Python: Select Interpreter”选择 conda 的 LLM 环境；当前工作区的已有配置保留。
+
+## LLM 配置与示例
+
+沿用现有环境变量，也可在项目目录的本地 `.env` 中配置（该文件已被 Git 忽略）：
+
+| 变量 | 含义 |
+| --- | --- |
+| DASHSCOPE_API_KEY | 自己账号的 API Key，不写进代码或提交 Git |
+| DASHSCOPE_BASE_URL | 当前账号/地域的 OpenAI 兼容接口地址 |
+| DASHSCOPE_MODEL | 所用模型 ID，结构化实验需支持 JSON Schema |
+
+三个变量都必填，空白值会被拒绝。当前程序设置客户端 timeout=60.0；未额外修改 SDK 的默认重试设置。结构化模式、思考模式与模型支持范围以 [DashScope 官方文档](https://help.aliyun.com/zh/model-studio/qwen-structured-output) 为准。
+
+以下命令在项目目录、LLM 环境中执行：
+
+```powershell
+# 离线：不需要密钥，不发送请求
+python examples/analyze_sales.py
+python examples/pydantic_validation.py
+
+# 真实请求：先配置环境变量
+python examples/hello_llm.py
+python examples/structured_output.py
+```
+
+hello_llm.py 发送一次请求；structured_output.py 的 main 按 QUESTIONS 发送三次独立请求。后者没有对话历史，仍是单轮实验。运行这些示例会产生实际 API 调用及相应 token 消耗。
+
+## 三种结构化处理方式
+
+| 当前实现 | 处理流程 | 返回结果 |
+| --- | --- | --- |
+| ask_llm + parse_analysis_answer | 流式 create → 拼接原始正文 → json.loads 与手写校验 | ask_llm 返回正文及调用元数据；解析函数返回回答字典 |
+| AnalysisAnswer 本地实验 | model_validate / model_validate_json → 严格类型与摘要校验 | Pydantic 模型，可导出字典/JSON/Schema |
+| ask_structured 独立实验 | SDK parse(response_format=AnalysisAnswer) → message.parsed → model_dump | 三字段回答字典，不包含调用元数据 |
+
+三字段为 `summary: str`、`explanation: str`、`missing_information: list[str]`。全部必填，禁止额外字段，summary 不得纯空白；explanation 可为空字符串，missing_information 可为空列表。手写解析与 Pydantic 模型目前并存，尚未替换或合并。
+
+Pydantic 会生成 Schema，SDK 将它作为接口级约束发送；自定义摘要校验仍在本地执行，不会自动成为同等的远端 Schema 约束。格式通过不代表统计内容正确，截断、拒绝回答和解析失败也仍需处理。完整接口与异常差异见 [HANDOFF](docs/HANDOFF.md)。
+
+## 当前验证范围
+
+2026-10-14 在现有 LLM 环境验收：**205 项离线测试通过**，Ruff 通过，mypy 检查 16 个源文件无错误。结构化测试既有模拟 SDK 返回，也有真实 SDK 配合 httpx.MockTransport 的内存 HTTP 响应；没有调用外部服务，不读取真实 .env。
+
+学习者已提供流式回答及一份三字段 JSON 的实际输出。原生 Schema/Pydantic parse 的三题真实运行记录尚未在仓库归档；离线测试不能代替模型行为评估。
+
+实际验收环境的 OpenAI SDK 为 3.14.1，而 pyproject 的 llm extra 声明 `openai>=1.60,<3`。两者尚未统一；这里如实记录，本次文档更新不调整环境或依赖。执行安装命令会按声明选择版本，不能把现有环境通过测试当成整个版本范围均已验证。详细版本见 HANDOFF。
 
 ## 示例数据和工具调用
 

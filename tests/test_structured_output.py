@@ -1,4 +1,4 @@
-"""Offline coverage of the JSON Schema experiment, without live requests."""
+"""Offline tests of SDK-generated Schema and Pydantic response parsing."""
 
 import importlib.util
 import json
@@ -7,13 +7,17 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import httpx
 import pytest
-from openai import OpenAIError
+from openai import LengthFinishReasonError, OpenAI, OpenAIError
+from pydantic import ValidationError
+
+from data_copilot.schemas import AnalysisAnswer
 
 
 @pytest.fixture
 def experiment(monkeypatch):
-    """Load the example freshly and replace the locally imported SDK client."""
+    """Load the example freshly and replace its locally imported SDK client."""
 
     def forbid_network(*args, **kwargs):
         raise AssertionError("Tests must not open a network connection")
@@ -24,9 +28,10 @@ def experiment(monkeypatch):
     monkeypatch.setenv("DASHSCOPE_MODEL", "configured-model")
     dotenv = Mock()
     monkeypatch.setattr("dotenv.load_dotenv", dotenv)
-    create = Mock(side_effect=AssertionError("No fake completion configured"))
+    parse = Mock(side_effect=AssertionError("No fake completion configured"))
+    create = Mock(side_effect=AssertionError("Must not fall back to create()"))
     client = SimpleNamespace(
-        chat=SimpleNamespace(completions=SimpleNamespace(create=create))
+        chat=SimpleNamespace(completions=SimpleNamespace(parse=parse, create=create))
     )
     constructor = Mock(return_value=client)
     monkeypatch.setattr("openai.OpenAI", constructor)
@@ -36,7 +41,11 @@ def experiment(monkeypatch):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return SimpleNamespace(
-        module=module, constructor=constructor, create=create, dotenv=dotenv
+        module=module,
+        constructor=constructor,
+        parse=parse,
+        create=create,
+        dotenv=dotenv,
     )
 
 
@@ -49,67 +58,54 @@ def valid_answer():
     }
 
 
-def completion(content, *, finish_reason="stop", refusal=None):
+def completion(parsed, *, finish_reason="stop", refusal=None):
     return SimpleNamespace(
         choices=[
             SimpleNamespace(
                 finish_reason=finish_reason,
-                message=SimpleNamespace(content=content, refusal=refusal),
+                message=SimpleNamespace(parsed=parsed, refusal=refusal),
             )
         ]
     )
 
 
 def set_completion(experiment, value):
-    experiment.create.side_effect = None
-    experiment.create.return_value = value
+    experiment.parse.side_effect = None
+    experiment.parse.return_value = value
 
 
 def test_import_has_no_request_or_config_loading(experiment):
     experiment.constructor.assert_not_called()
+    experiment.parse.assert_not_called()
     experiment.create.assert_not_called()
     experiment.dotenv.assert_not_called()
 
 
-def test_schema_request_and_local_validation(
-    experiment, valid_answer, monkeypatch, capsys
+def test_model_class_is_sent_and_parsed_model_is_dumped(
+    experiment, valid_answer, capsys
 ):
-    body = json.dumps(valid_answer, ensure_ascii=False)
-    set_completion(experiment, completion(body))
-    parser = Mock(wraps=experiment.module.parse_analysis_answer)
-    monkeypatch.setattr(experiment.module, "parse_analysis_answer", parser)
+    model = AnalysisAnswer.model_validate(valid_answer)
+    set_completion(experiment, completion(model))
     result = experiment.module.ask_structured("请分析销售额")
+    assert isinstance(result, dict)
     assert result == valid_answer
     assert json.loads(json.dumps(result, allow_nan=False)) == valid_answer
-    parser.assert_called_once_with(body)
     experiment.constructor.assert_called_once_with(
         api_key="offline-key",
         base_url="https://example.invalid/v1",
         timeout=60.0,
     )
-    experiment.create.assert_called_once()
-    request = experiment.create.call_args.kwargs
+    experiment.parse.assert_called_once()
+    request = experiment.parse.call_args.kwargs
     assert request["model"] == "configured-model"
-    assert request["stream"] is False
+    assert request["response_format"] is AnalysisAnswer
     assert "stream_options" not in request
+    assert request.get("stream", False) is False
     assert request["messages"] == [
         {"role": "system", "content": experiment.module.SYSTEM_PROMPT},
         {"role": "user", "content": "请分析销售额"},
     ]
-    response_format = request["response_format"]
-    assert response_format["type"] == "json_schema"
-    constraint = response_format["json_schema"]
-    assert isinstance(constraint["name"], str) and constraint["name"].strip()
-    assert constraint["strict"] is True
-    schema = constraint["schema"]
-    assert schema["type"] == "object"
-    assert schema["properties"] == {
-        "summary": {"type": "string"},
-        "explanation": {"type": "string"},
-        "missing_information": {"type": "array", "items": {"type": "string"}},
-    }
-    assert set(schema["required"]) == {"summary", "explanation", "missing_information"}
-    assert schema["additionalProperties"] is False
+    experiment.create.assert_not_called()
     output = capsys.readouterr()
     assert output.out == output.err == ""
 
@@ -119,7 +115,7 @@ def test_blank_question_prevents_client_creation(experiment, question):
     with pytest.raises(ValueError, match="不能为空"):
         experiment.module.ask_structured(question)
     experiment.constructor.assert_not_called()
-    experiment.create.assert_not_called()
+    experiment.parse.assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -151,58 +147,48 @@ def test_no_choices(experiment):
         ("tool_calls", "tool_calls"),
     ],
 )
-def test_invalid_finish_prevents_parsing(experiment, monkeypatch, reason, message):
-    set_completion(experiment, completion("not JSON", finish_reason=reason))
-    parser = Mock()
-    monkeypatch.setattr(experiment.module, "parse_analysis_answer", parser)
+def test_invalid_finish_is_rejected(experiment, reason, message):
+    set_completion(experiment, completion(None, finish_reason=reason))
     with pytest.raises(RuntimeError, match=message):
         experiment.module.ask_structured("question")
-    parser.assert_not_called()
 
 
-def test_refusal_prevents_parsing(experiment, monkeypatch):
-    set_completion(experiment, completion("not JSON", refusal="declined"))
-    parser = Mock()
-    monkeypatch.setattr(experiment.module, "parse_analysis_answer", parser)
+def test_refusal_is_rejected(experiment):
+    set_completion(experiment, completion(None, refusal="declined"))
     with pytest.raises(RuntimeError, match="拒绝回答"):
         experiment.module.ask_structured("question")
-    parser.assert_not_called()
 
 
-@pytest.mark.parametrize("content", [None, "", " \n\t"])
-def test_empty_body(experiment, content):
-    set_completion(experiment, completion(content))
-    with pytest.raises(RuntimeError, match="有效正文"):
+@pytest.mark.parametrize("parsed", [None, {}, "not a validated model"])
+def test_missing_or_wrong_parsed_result_is_rejected(experiment, parsed):
+    set_completion(experiment, completion(parsed))
+    with pytest.raises(RuntimeError, match="有效解析结果"):
         experiment.module.ask_structured("question")
 
 
-@pytest.mark.parametrize("body", ["not JSON", "```json\n{}\n```"])
-def test_bad_json_is_not_repaired_or_retried(experiment, body):
-    set_completion(experiment, completion(body))
-    with pytest.raises(json.JSONDecodeError) as caught:
-        experiment.module.ask_structured("question")
-    assert caught.value.doc == body
-    experiment.create.assert_called_once()
-
-
-def test_blank_summary_rejected_despite_string_schema(experiment, valid_answer):
-    valid_answer["summary"] = " \t"
-    set_completion(experiment, completion(json.dumps(valid_answer)))
-    with pytest.raises(ValueError, match="summary"):
-        experiment.module.ask_structured("question")
-    experiment.create.assert_called_once()
-
-
-def test_api_failure_is_preserved_without_fallback(experiment):
+def test_sdk_error_is_preserved_without_fallback(experiment):
     original = OpenAIError("schema request failed")
-    experiment.create.side_effect = original
+    experiment.parse.side_effect = original
     with pytest.raises(OpenAIError) as caught:
         experiment.module.ask_structured("question")
     assert caught.value is original
-    experiment.create.assert_called_once()
-    assert (
-        experiment.create.call_args.kwargs["response_format"]["type"] == "json_schema"
-    )
+    experiment.parse.assert_called_once()
+    experiment.create.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "raw", ["not JSON", '{"summary":" ","explanation":"","missing_information":[]}']
+)
+def test_pydantic_error_is_preserved_without_fallback(experiment, raw):
+    with pytest.raises(ValidationError) as initial:
+        AnalysisAnswer.model_validate_json(raw)
+    original = initial.value
+    experiment.parse.side_effect = original
+    with pytest.raises(ValidationError) as caught:
+        experiment.module.ask_structured("question")
+    assert caught.value is original
+    experiment.parse.assert_called_once()
+    experiment.create.assert_not_called()
 
 
 def test_main_displays_each_question_result(
@@ -216,7 +202,6 @@ def test_main_displays_each_question_result(
     assert [call.args for call in ask.call_args_list] == [(q,) for q in questions]
     output = capsys.readouterr()
     assert output.err == ""
-    # The CLI prints separate JSON documents, one per question.
     remaining = output.out.strip()
     decoder = json.JSONDecoder()
     records = []
@@ -225,3 +210,70 @@ def test_main_displays_each_question_result(
         records.append(record)
         remaining = remaining[end:].lstrip()
     assert records == [{"question": q, "result": valid_answer} for q in questions]
+
+
+@pytest.mark.parametrize(
+    "scenario", ["valid", "blank_summary", "invalid_json", "length", "refusal"]
+)
+def test_real_sdk_with_mock_http_transport(
+    experiment, valid_answer, monkeypatch, scenario
+):
+    """Use the actual SDK parser; MockTransport handles HTTP entirely in memory."""
+    requests = []
+    data = dict(valid_answer)
+    if scenario == "blank_summary":
+        data["summary"] = " \t"
+    content = "not JSON" if scenario == "invalid_json" else json.dumps(data)
+
+    def handle(request):
+        requests.append(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={
+                "id": "offline-completion",
+                "object": "chat.completion",
+                "created": 0,
+                "model": "configured-model",
+                "choices": [
+                    {
+                        "index": 0,
+                        "finish_reason": "length" if scenario == "length" else "stop",
+                        "message": {
+                            "role": "assistant",
+                            "content": content,
+                            "refusal": "declined" if scenario == "refusal" else None,
+                        },
+                    }
+                ],
+            },
+        )
+
+    with httpx.Client(transport=httpx.MockTransport(handle)) as http_client:
+        with OpenAI(
+            api_key="offline-key",
+            base_url="https://example.invalid/v1",
+            max_retries=0,
+            http_client=http_client,
+        ) as client:
+            monkeypatch.setattr("openai.OpenAI", Mock(return_value=client))
+            if scenario == "valid":
+                assert experiment.module.ask_structured("question") == valid_answer
+            elif scenario in {"blank_summary", "invalid_json"}:
+                with pytest.raises(ValidationError):
+                    experiment.module.ask_structured("question")
+            elif scenario == "length":
+                with pytest.raises(LengthFinishReasonError):
+                    experiment.module.ask_structured("question")
+            else:
+                with pytest.raises(RuntimeError, match="拒绝回答"):
+                    experiment.module.ask_structured("question")
+
+    assert len(requests) == 1
+    response_format = requests[0]["response_format"]
+    assert response_format["type"] == "json_schema"
+    assert response_format["json_schema"]["strict"] is True
+    schema = response_format["json_schema"]["schema"]
+    assert set(schema["required"]) == {"summary", "explanation", "missing_information"}
+    assert schema["additionalProperties"] is False
+    assert schema["properties"]["summary"]["type"] == "string"
+    assert schema["properties"]["missing_information"]["items"]["type"] == "string"

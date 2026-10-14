@@ -1,10 +1,24 @@
-# Phase 0 代码交接
+# 当前代码与学习交接（更新至任务 06C）
+
+更新日期：2026-10-14。统计模块与模型实验目前独立，学习任务 07 尚未实现。
 
 ## 模块职责和数据流
 
-`data_loader.py` 负责本地文件检查、CSV 结构校验、Pandas 读取、数据集信息和预览。`analysis_tools.py` 负责纯统计计算和参数校验；`dataset_info` 从读取模块复用并公开导出。`__init__.py` 只有包说明。测试均不访问网络。
+| 模块 | 职责 |
+| --- | --- |
+| data_loader.py | 本地 CSV 校验与读取、数据集基本信息和预览 |
+| analysis_tools.py | 纯统计计算与参数校验，复用并公开导出 dataset_info |
+| llm_client.py | SYSTEM_PROMPT、配置检查、流式 ask_llm、正文与调用元数据 |
+| response_parser.py | 标准库 JSON 解析、手写字段与类型校验 |
+| schemas.py | Pydantic v2 AnalysisAnswer，严格类型、必填字段、空白摘要校验 |
+| examples/structured_output.py | 独立 ask_structured，非流式 SDK parse 与模型对象导出 |
+| examples/pydantic_validation.py | 五个 Pydantic 接口的纯本地演示 |
+| examples/hello_llm.py | 调用 ask_llm 后手写解析，并负责打印 |
+| examples/analyze_sales.py | 无模型请求的纯统计示例 |
 
-调用流程：`load_csv(path)` → DataFrame → `dataset_overview(df)` 检查字段及缺失 → 选择统计函数并传入同一 df → 结构化字典 → 调用端 `json.dumps(..., allow_nan=False)`。核心函数无 print、全局 DataFrame、网络请求或 LLM 逻辑。
+__init__.py 只有包说明。全部测试离线；API 测试隔离 .env 并替换客户端或 HTTP 传输。
+
+调用流程：`load_csv(path)` → DataFrame → `dataset_overview(df)` 检查字段及缺失 → 选择统计函数并传入同一 df → 结构化字典 → 调用端 `json.dumps(..., allow_nan=False)`。统计核心无 print、全局 DataFrame、网络请求或 LLM 逻辑。
 
 ## 公开接口
 
@@ -58,6 +72,79 @@ aggregation 为 mean/sum/count/min/max。目标列须为实数数值列。分组
 
 成对删除缺失值。`sample_size` 为真实有效样本对数。只支持 pearson，同一数值列可与自身计算。状态为 ok、insufficient_samples（少于两对）、zero_variance（任一列恒定）、nonfinite_result（数值计算产生非有限值）；后三者 coefficient 均为 null。结果不说明因果。
 
+## 模型调用与回答接口
+
+### ask_llm(question: str) -> dict
+
+位于 llm_client.py，调用时读取配置并发出流式请求，导入不发请求。当前开启 enable_thinking，但只收集 content，不返回或展示 reasoning_content；请求 include_usage，正确处理无 choices 的用量块。
+
+```json
+{
+  "answer": "模型原始正文，此时通常是 JSON 文本",
+  "model": "服务实际返回的模型 ID",
+  "finish_reason": "stop",
+  "usage": {"prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30}
+}
+```
+
+数字仅为格式示例。model 未返回时为 null，不用配置模型伪装成实际模型；usage 未返回时为 null。函数内部不打印，异常不吞掉。answer 是原始字符串，不是已解析的回答字典。
+
+### parse_analysis_answer(answer: str) -> dict
+
+位于 response_parser.py，使用 json.loads，不删除代码围栏、不补字段、不修复 JSON。返回恰好包含以下字段的字典：
+
+```json
+{
+  "summary": "直接结论",
+  "explanation": "必要的说明",
+  "missing_information": []
+}
+```
+
+summary 为非空白字符串，explanation 为字符串且可为空，missing_information 为字符串列表且可为空；禁止额外字段。解析和展示分离，原文中的合法空格不会被悄悄去掉。
+
+### AnalysisAnswer
+
+位于 schemas.py，三个字段无默认值，ConfigDict(strict=True, extra="forbid")。summary 的 field_validator 只检查 .strip() 是否非空，返回原始 value。
+
+| 方法 | 输入与结果 |
+| --- | --- |
+| AnalysisAnswer.model_validate(data) | 校验 Python 数据，返回模型对象 |
+| AnalysisAnswer.model_validate_json(text) | 解析并校验 JSON，返回模型对象 |
+| instance.model_dump() | 导出字典 |
+| instance.model_dump_json() | 导出 JSON 字符串 |
+| AnalysisAnswer.model_json_schema() | 导出 JSON Schema 字典 |
+
+自定义 summary 校验不会自动变成同等的 Schema 约束；字符串类型本身允许纯空白。本地校验与接口约束的作用不同。模型结构校验也不判断统计内容是否正确。
+
+### ask_structured(question: str) -> dict
+
+目前位于 examples/structured_output.py，是独立学习实验，尚未提取为包级服务。流程：检查配置 → SDK chat.completions.parse(response_format=AnalysisAnswer) → 检查结束状态与 refusal → 检查 message.parsed 是 AnalysisAnswer → model_dump。
+
+返回三字段回答字典，格式与上例一致，但不包含 ask_llm 的模型名/usage 等元数据。SDK 自动从 Pydantic 类生成严格 Schema，不再维护手写 ANALYSIS_SCHEMA。此路径非流式，没有显式打开思考模式；模型默认设置取决于服务。只发送一次请求，不是多轮对话。
+
+### 当前两条模型路径
+
+- hello_llm：ask_llm → 原始 answer 字符串 → parse_analysis_answer → 展示。这里靠提示词约定 JSON，没有接口级 response_format。
+- structured_output：SDK parse → 自动 Schema 约束 → Pydantic 本地校验 → 回答字典 → 展示。拒绝、截断和校验失败不降级到 create。
+
+现有 response_parser 仍保留，未被 Pydantic 全局替换。统计结果也尚未进入任一模型请求；任务 07 将首次连接它们。
+
+### LLM 配置和异常
+
+DASHSCOPE_API_KEY、DASHSCOPE_BASE_URL、DASHSCOPE_MODEL 都必填，调用时 load_dotenv()，已有进程变量按 dotenv 默认行为优先。timeout=60.0，未额外设置重试次数；SDK 可能执行其默认重试，业务层没有自行回退或修补。
+
+| 异常/状态 | 触发条件与当前行为 |
+| --- | --- |
+| ValueError | 两个调用函数的空白问题；手写解析的字段/类型/空摘要错误 |
+| RuntimeError | 配置缺失、流式结束标记异常、空正文；结构化实验无 choices、拒绝或无有效 parsed |
+| json.JSONDecodeError | response_parser 中 JSON 文本非法，保留原始异常 |
+| pydantic.ValidationError | model_validate_json 的 JSON/字段/摘要错误；SDK parse 可能直接传出该异常 |
+| SDK API/连接/超时异常 | 原样传出，保留真实失败原因 |
+| SDK 长度限制/内容过滤异常 | parse 可能在返回 completion 前抛出，不应只依赖返回后的 finish_reason 检查 |
+
+两条调用函数都不打印；示例负责展示。这样同一返回值可以用于测试、命令行或后续业务，而不绑定到某种展示方式。
+
 ## 异常与数据约定
 
 | 异常 | 触发条件 |
@@ -76,15 +163,15 @@ JSON 转换由私有 `_json_value` 统一处理：NumPy 标量转原生类型，
 
 ## 后续如何复用
 
-Phase 1 可独立增加 `src/data_copilot/llm_client.py`，只练习 API 基础调用；本阶段没有创建该文件或安装 LLM SDK。先理解正常响应、超时、认证错误和环境变量，再考虑 Prompt 与结构化结果。
+学习任务 01～06C 已完成基础调用、提示词、解析和 Pydantic/SDK 结构化实验。下一步任务 07 先固定调用统计函数，再将结果作为模型输入，不让模型选择或执行工具。
 
-Phase 3 可复用所有统计函数：模型提出函数名称和列名参数，Python 执行层做白名单校验，绑定当前数据集的 DataFrame，再调用对应函数，将结构化结果发送给模型。DataFrame 应由程序持有，不放入模型生成的 JSON 参数。工具定义只描述 columns/group_column/target_column/aggregation/x_column/y_column 等可序列化参数；不要让模型执行任意 Python 或任意读取路径。错误转换应保留真实原因，不伪造结果。以上为接入建议，尚无工具注册、模型调用或 Agent 实现。
+Phase 3 可复用所有统计函数：模型提出函数名称和列名参数，Python 执行层做白名单校验，绑定当前数据集的 DataFrame，再调用对应函数，将结构化结果发送给模型。DataFrame 应由程序持有，不放入模型生成的 JSON 参数。工具定义只描述 columns/group_column/target_column/aggregation/x_column/y_column 等可序列化参数；不要让模型执行任意 Python 或任意读取路径。错误转换应保留真实原因，不伪造结果。以上是未来 Function Calling 接入建议；目前虽有单次模型调用，但没有工具注册、模型选择统计工具或 Agent 实现。
 
 ## 当前限制和阅读顺序
 
-CSV 校验一遍、读取一遍，无大小上限且完整加载内存，读取时文件须稳定；只支持本地逗号 CSV，无远程 URL/Excel/自动编码推断。数值工具不自动转换对象列，时间数据和复数不作为数值分析对象。输入列名必须唯一非空字符串；组键需可哈希和可序列化。没有持久化、上传接口、认证、缓存、LLM 或前端业务。
+CSV 校验一遍、读取一遍，无大小上限且完整加载内存，读取时文件须稳定；只支持本地逗号 CSV，无远程 URL/Excel/自动编码推断。数值工具不自动转换对象列，时间数据和复数不作为数值分析对象。输入列名必须唯一非空字符串；组键需可哈希和可序列化。没有持久化、上传接口、认证、业务缓存或前端；已有 LLM 调用还未接入统计数据流。
 
-建议先读 `data_loader.py`，理解错误边界与 DataFrame；再读 `analysis_tools.py`，理解工具签名、缺失值和计算约定；随后读两份测试，用手算核对结果。最后读 pyproject 和 README，理解 conda 环境、editable 包安装、依赖声明和运行方式。Phase 1 自行按供应商定义环境变量并添加有实际内容的环境模板；真实 `.env` 已忽略。
+建议先读 `data_loader.py`，理解错误边界与 DataFrame；再读 `analysis_tools.py`，理解工具签名、缺失值和计算约定；随后读统计测试，用手算核对结果；再读 llm_client、response_parser、schemas 和 structured_output 示例，比较原始字符串与模型对象。对应测试演示了如何隔离 API。最后读 pyproject 和 README，理解安装与验证命令。配置沿用现有 DASHSCOPE 环境变量，真实 .env 已忽略。
 
 CSV 含 NUL（空字节）时会抛出 CSVValidationError，防止底层读取器截断内容而丢失数据。
 
@@ -103,9 +190,9 @@ CSV 含 NUL（空字节）时会抛出 CSVValidationError，防止底层读取�
 
 首次 pytest 因系统临时目录权限出现 setup errors，现通过工作区内的专用缓存目录解决；换行测试显式禁用 Windows 自动转换，未削弱断言。最终无未解决的 Phase 0 问题。最低 Python 3.11 的兼容性由语法/依赖约束声明，本次没有单独运行 3.11 解释器。
 
-## 当前开发环境约定
+## 开发环境约定
 
-后续统一使用 conda 的 `LLM` 环境，本机 Python 3.12.13。先在项目目录执行 `conda run -n LLM python -m pip install -e ".[dev]"`；测试用 `conda run -n LLM python -m pytest -q`，代码检查用同一环境的 `python -m ruff`。完整命令见 README。
+后续统一使用 conda 的 `LLM` 环境，本机 Python 3.12.13。先在项目目录执行 `conda run -n LLM python -m pip install -e ".[dev,llm]"`；测试用 `conda run -n LLM python -m pytest -q`，代码检查用同一环境的 `python -m ruff`。完整命令见 README。
 
 开发依赖改为 pyproject 的 dev extra，pip 可以直接安装，无需 uv。新机器使用 README 中的 conda create 命令建立环境，项目依赖只在 pyproject.toml 中声明。旧 uv.lock 移除，旧验收记录保留用于追溯。
 
@@ -126,3 +213,16 @@ CSV 含 NUL（空字节）时会抛出 CSVValidationError，防止底层读取�
 ## 仓库精简
 
 移除可选的编辑器与 Git 换行配置、空环境模板及单独的 conda 环境描述文件。保留 pyproject.toml 管理依赖、Ruff 和 pytest 配置；README 记录环境安装步骤；AGENTS.md 保存 conda LLM 和开发边界约定；TASKS.md 保留阶段规划。
+
+## 任务 06C 后的最新验收（2026-10-14）
+
+- 全部 205 项测试通过，Ruff 通过，mypy 检查 16 个源文件无错误。
+- 实际环境：Python 3.12.13、OpenAI SDK 3.14.1、Pydantic 2.13.5、Pandas 3.0.6、NumPy 2.5.3、pytest 9.1.1、mypy 2.3.1、Ruff 0.16.8。
+- tests/test_llm_client：流式拼接、配置、usage 缺失、真实异常保留、导入与打印边界。
+- tests/test_response_parser：非法 JSON、字段/类型错误、原文保留。
+- tests/test_schemas：严格类型、必填/额外字段、空摘要、模型导出和 Schema。
+- tests/test_structured_output：parse 调用、缺失 parsed、refusal、无回退，以及真实 SDK + MockTransport 的 Schema 发送和本地校验。HTTP 在内存中模拟，不访问真实服务。
+- 本轮没有发送真实 API 请求；原生结构化模式三题结果仍待归档。当前 environment 的 SDK 3.14.1 超出 pyproject 的 openai>=1.60,<3，依赖一致性与声明范围内的版本验证待单独处理。
+- 目前 SYSTEM_PROMPT 含角色、数据真实性、统计解释、信息不足处理和 JSON 格式要求，但尚未恢复前轮关于未经计算不编造系数/预测值、显著性与因果识别、有效记录数的详细优化规则。不要把曾经的提示词修改记录当成当前内容。
+
+上述数字为检查快照，不是模型准确率或真实接口成功率。历史 Phase 0 验收段落保留作追溯，不表示当前仍使用 uv 或没有 LLM 实现。
