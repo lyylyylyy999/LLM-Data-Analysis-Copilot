@@ -131,7 +131,7 @@ def correlation(
     elif x.nunique() < 2 or y.nunique() < 2:
         status = "zero_variance"
     else:
-        coefficient = _json_value(x.corr(y, method=method))
+        coefficient = _json_value(x.corr(y, method="pearson"))
         status = "ok" if coefficient is not None else "nonfinite_result"
     return {
         "x_column": x_column,

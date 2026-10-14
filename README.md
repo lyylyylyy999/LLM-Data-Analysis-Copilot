@@ -37,6 +37,7 @@ conda activate LLM
 python -m pip install -e ".[dev,llm]"
 python -m pytest -q
 python -m ruff check .
+python -m mypy .
 python -m ruff format --check .
 python examples/analyze_sales.py
 ```
@@ -101,3 +102,5 @@ print(json.dumps(results, ensure_ascii=False, allow_nan=False, indent=2))
 CSV 含 NUL（空字节）时会抛出 CSVValidationError，防止底层读取器截断内容而丢失数据。
 
 工具参数在执行前校验：列名必须为非空字符串，columns 必须是单个列名或字符串序列，aggregation/method 必须是字符串。非法类型抛出 TypeError，合法类型但非法值抛出 ValueError。
+
+类型检查使用 mypy，Pandas 的类型信息由开发依赖 pandas-stubs 提供。在项目目录运行 `python -m mypy .`；只使用类型存根，不需要忽略缺失导入错误。

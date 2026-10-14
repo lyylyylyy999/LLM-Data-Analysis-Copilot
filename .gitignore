@@ -16,3 +16,5 @@ htmlcov/
 /data/samples/*
 !/data/samples/sales.csv
 .vscode
+
+.mypy_cache/
