@@ -18,7 +18,7 @@ llm-data-analysis-copilot/
 │   ├── __init__.py
 │   ├── data_loader.py       # CSV 校验、读取、概览
 │   ├── analysis_tools.py    # 四类统计工具
-│   ├── llm_client.py        # 流式调用与 SYSTEM_PROMPT
+│   ├── llm_client.py        # 流式 JSON Schema 结构化调用与 SYSTEM_PROMPT
 │   ├── response_parser.py   # 手写 JSON 字段校验
 │   └── schemas.py           # Pydantic AnalysisAnswer
 ├── examples/
@@ -100,11 +100,13 @@ hello_llm.py 发送一次请求；structured_output.py 的 main 按 QUESTIONS �
 
 | 当前实现 | 处理流程 | 返回结果 |
 | --- | --- | --- |
-| ask_llm + parse_analysis_answer | 流式 create → 拼接原始正文 → json.loads 与手写校验 | ask_llm 返回正文及调用元数据；解析函数返回回答字典 |
+| ask_llm + parse_analysis_answer | 流式 create(response_format=json_schema) → 拼接正文 → Pydantic 校验 → 手写解析 | ask_llm 返回已校验的 JSON 正文及调用元数据；解析函数返回回答字典 |
 | AnalysisAnswer 本地实验 | model_validate / model_validate_json → 严格类型与摘要校验 | Pydantic 模型，可导出字典/JSON/Schema |
 | ask_structured 独立实验 | SDK parse(response_format=AnalysisAnswer) → message.parsed → model_dump | 三字段回答字典，不包含调用元数据 |
 
 三字段为 `summary: str`、`explanation: str`、`missing_information: list[str]`。全部必填，禁止额外字段，summary 不得纯空白；explanation 可为空字符串，missing_information 可为空列表。手写解析与 Pydantic 模型目前并存，尚未替换或合并。
+
+`ask_llm` 现已发送由 `AnalysisAnswer.model_json_schema()` 生成的严格接口级 Schema，保留流式响应和原有返回格式，并显式设置 `enable_thinking=False`。需要配置支持 JSON Schema 的模型；不支持或校验失败时直接报错，不回退到仅提示词模式。`hello_llm.py` 无需修改即可使用该路径。
 
 Pydantic 会生成 Schema，SDK 将它作为接口级约束发送；自定义摘要校验仍在本地执行，不会自动成为同等的远端 Schema 约束。格式通过不代表统计内容正确，截断、拒绝回答和解析失败也仍需处理。完整接口与异常差异见 [HANDOFF](docs/HANDOFF.md)。
 

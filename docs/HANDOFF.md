@@ -76,11 +76,11 @@ aggregation 为 mean/sum/count/min/max。目标列须为实数数值列。分组
 
 ### ask_llm(question: str) -> dict
 
-位于 llm_client.py，调用时读取配置并发出流式请求，导入不发请求。当前开启 enable_thinking，但只收集 content，不返回或展示 reasoning_content；请求 include_usage，正确处理无 choices 的用量块。
+位于 llm_client.py，调用时读取配置并发出流式请求，导入不发请求。2026-10-15 起通过 response_format=json_schema 发送 AnalysisAnswer.model_json_schema() 生成的严格 Schema，并设置 enable_thinking=False；请求 include_usage，正确处理无 choices 的用量块。收集正文后使用 AnalysisAnswer.model_validate_json 校验，拒绝回答或校验失败时直接报错，不降级为提示词模式。模型必须支持 JSON Schema。
 
 ```json
 {
-  "answer": "模型原始正文，此时通常是 JSON 文本",
+  "answer": "通过 Pydantic 校验的模型原始 JSON 正文",
   "model": "服务实际返回的模型 ID",
   "finish_reason": "stop",
   "usage": {"prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30}
@@ -125,7 +125,7 @@ summary 为非空白字符串，explanation 为字符串且可为空，missing_i
 
 ### 当前两条模型路径
 
-- hello_llm：ask_llm → 原始 answer 字符串 → parse_analysis_answer → 展示。这里靠提示词约定 JSON，没有接口级 response_format。
+- hello_llm：ask_llm → 流式 create 的接口级 JSON Schema 约束 → Pydantic 本地校验 → 原始 answer 字符串 → parse_analysis_answer → 展示。保留原有返回格式与手写解析示例。
 - structured_output：SDK parse → 自动 Schema 约束 → Pydantic 本地校验 → 回答字典 → 展示。拒绝、截断和校验失败不降级到 create。
 
 现有 response_parser 仍保留，未被 Pydantic 全局替换。统计结果也尚未进入任一模型请求；任务 07 将首次连接它们。

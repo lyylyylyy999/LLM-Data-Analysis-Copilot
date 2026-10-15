@@ -68,16 +68,16 @@ def ask_structured(question: str) -> dict:
 
 
 def main() -> None:
-    for question in QUESTIONS:
-        parsed = ask_structured(question)
-        print(
-            json.dumps(
-                {"question": question, "result": parsed},
-                ensure_ascii=False,
-                indent=2,
-                allow_nan=False,
-            )
+    question = "什么是过拟合？"
+    parsed = ask_structured(question)
+    print(
+        json.dumps(
+            {"question": question, "result": parsed},
+            ensure_ascii=False,
+            indent=2,
+            allow_nan=False,
         )
+    )
 
 
 if __name__ == "__main__":

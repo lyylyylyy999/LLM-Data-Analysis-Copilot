@@ -3,6 +3,8 @@ import os
 from dotenv import load_dotenv
 from openai import OpenAI
 
+from data_copilot.schemas import AnalysisAnswer
+
 SYSTEM_PROMPT = """
 你是一名专业、严谨的数据分析助手，负责回答数据分析、统计学及相关问题。
 
@@ -60,7 +62,7 @@ SYSTEM_PROMPT = """
 
 
 def ask_llm(question: str) -> dict:
-    """调用大模型，返回原始正文、模型名称、结束原因和 Token 用量。"""
+    """流式请求接口级结构化输出，校验后返回原始 JSON 正文及调用元数据。"""
 
     if not question.strip():
         raise ValueError("question 不能为空或空白内容")
@@ -97,7 +99,15 @@ def ask_llm(question: str) -> dict:
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": question},
         ],
-        extra_body={"enable_thinking": True},
+        response_format={
+            "type": "json_schema",
+            "json_schema": {
+                "name": "AnalysisAnswer",
+                "strict": True,
+                "schema": AnalysisAnswer.model_json_schema(),
+            },
+        },
+        extra_body={"enable_thinking": False},
         stream=True,
         stream_options={"include_usage": True},
     )
@@ -107,6 +117,7 @@ def ask_llm(question: str) -> dict:
     model_name = None
     finish_reason = None
     usage = None
+    refused = False
 
     # 5. 处理流式响应
     for chunk in response:
@@ -128,6 +139,8 @@ def ask_llm(question: str) -> dict:
             continue
 
         choice = chunk.choices[0]
+        if getattr(choice.delta, "refusal", None):
+            refused = True
 
         # 保存结束原因
         if choice.finish_reason is not None:
@@ -152,10 +165,16 @@ def ask_llm(question: str) -> dict:
     if finish_reason != "stop":
         raise RuntimeError(f"模型未正常结束：{finish_reason}")
 
+    if refused:
+        raise RuntimeError("模型拒绝回答")
+
     if not answer.strip():
         raise RuntimeError("模型未返回有效正文")
 
-    # 8. 返回结构化结果（answer 仍是模型原始正文）
+    # 接口约束之外，仍需本地校验（例如 summary 不得纯空白）。
+    AnalysisAnswer.model_validate_json(answer)
+
+    # 8. 保留原有返回格式，answer 是通过校验的原始 JSON 字符串。
     return {
         "answer": answer,
         "model": model_name,
