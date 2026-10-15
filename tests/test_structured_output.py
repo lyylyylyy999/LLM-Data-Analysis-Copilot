@@ -191,25 +191,20 @@ def test_pydantic_error_is_preserved_without_fallback(experiment, raw):
     experiment.create.assert_not_called()
 
 
-def test_main_displays_each_question_result(
+def test_main_displays_single_question_result(
     experiment, valid_answer, monkeypatch, capsys
 ):
-    questions = ("概念问题", "缺少数据的问题", "因果问题")
-    monkeypatch.setattr(experiment.module, "QUESTIONS", questions)
+    # The example's main now demonstrates one request rather than a QUESTIONS loop.
     ask = Mock(return_value=valid_answer)
     monkeypatch.setattr(experiment.module, "ask_structured", ask)
     experiment.module.main()
-    assert [call.args for call in ask.call_args_list] == [(q,) for q in questions]
+    ask.assert_called_once_with("什么是过拟合？")
     output = capsys.readouterr()
     assert output.err == ""
-    remaining = output.out.strip()
-    decoder = json.JSONDecoder()
-    records = []
-    while remaining:
-        record, end = decoder.raw_decode(remaining)
-        records.append(record)
-        remaining = remaining[end:].lstrip()
-    assert records == [{"question": q, "result": valid_answer} for q in questions]
+    assert json.loads(output.out) == {
+        "question": "什么是过拟合？",
+        "result": valid_answer,
+    }
 
 
 @pytest.mark.parametrize(
