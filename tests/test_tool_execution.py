@@ -14,6 +14,7 @@ from openai import OpenAIError
 from openai.types.chat import ChatCompletionMessageFunctionToolCall
 
 from data_copilot.analysis_tools import dataset_info as real_dataset_info
+from data_copilot.analysis_tools import describe_numeric as real_describe_numeric
 from data_copilot.data_loader import load_csv as real_load_csv
 
 
@@ -63,6 +64,12 @@ def workflow(monkeypatch, tmp_path):
 
     execute_mock = Mock(side_effect=execute)
 
+    def describe(dataframe, columns):
+        events.append("execute")
+        return real_describe_numeric(dataframe, columns)
+
+    describe_mock = Mock(side_effect=describe)
+
     def submit(**kwargs):
         # Snapshot at call time: the example extends the same messages list later.
         requests.append(copy.deepcopy(kwargs))
@@ -89,6 +96,7 @@ def workflow(monkeypatch, tmp_path):
     read = Mock(wraps=real_load_csv)
     monkeypatch.setattr(module, "load_csv", read)
     monkeypatch.setattr(module, "dataset_info", execute_mock)
+    monkeypatch.setattr(module, "describe_numeric", describe_mock)
     csv_path = tmp_path / "tiny.csv"
     csv_path.write_text("region,sales\nEast,10\nWest,\nNorth,30\n", encoding="utf-8")
     return SimpleNamespace(
@@ -96,6 +104,7 @@ def workflow(monkeypatch, tmp_path):
         create=create,
         constructor=constructor,
         execute=execute_mock,
+        describe=describe_mock,
         read=read,
         pending=pending,
         requests=requests,
@@ -107,6 +116,7 @@ def workflow(monkeypatch, tmp_path):
 
 def assert_no_execution_or_second_request(workflow):
     workflow.execute.assert_not_called()
+    workflow.describe.assert_not_called()
     assert workflow.create.call_count == 1
 
 
@@ -114,6 +124,7 @@ def test_import_has_no_io(workflow):
     workflow.constructor.assert_not_called()
     workflow.create.assert_not_called()
     workflow.execute.assert_not_called()
+    workflow.describe.assert_not_called()
     workflow.read.assert_not_called()
     workflow.dotenv.assert_not_called()
 
@@ -144,10 +155,13 @@ def test_complete_message_chain_uses_real_dataframe(workflow, capsys):
     assert first["tool_choice"] == "auto"
     assert first["tools"] == workflow.module.TOOLS
     assert len(first["messages"]) == 2
-    assert first["messages"] == [
-        {"role": "system", "content": workflow.module.SYSTEM_PROMPT},
-        {"role": "user", "content": workflow.module.QUESTION},
-    ]
+    assert first["messages"][0]["role"] == "system"
+    system = first["messages"][0]["content"]
+    assert system.startswith(workflow.module.SYSTEM_PROMPT)
+    metadata = json.loads(system[system.index("{") :])
+    assert metadata == {name: str(dtype) for name, dtype in dataframe.dtypes.items()}
+    assert first["messages"][1] == {"role": "user", "content": workflow.module.QUESTION}
+    assert "East" not in system and "North" not in system
     assert "tools" not in second and "tool_choice" not in second
     assert "response_format" not in first and "response_format" not in second
     assert second["messages"][:2] == first["messages"]
@@ -232,7 +246,7 @@ def test_multiple_calls_are_not_partially_executed(workflow):
     workflow.pending[0] = response(
         calls=[tool_call(), tool_call(identifier="call_2")], finish_reason="tool_calls"
     )
-    with pytest.raises(ValueError, match="恰好调用一次"):
+    with pytest.raises(ValueError, match="只支持一次工具调用"):
         workflow.module.main(workflow.csv)
     assert_no_execution_or_second_request(workflow)
 
@@ -380,3 +394,219 @@ def test_blank_final_answer_is_rejected(workflow, content):
     workflow.pending[1] = response(content=content)
     with pytest.raises(RuntimeError, match="有效正文"):
         workflow.module.main(workflow.csv)
+
+
+def test_two_tool_schemas_do_not_change_task08_tool_definitions(workflow):
+    from examples.tool_calling import TOOLS as observation_tools
+
+    functions = {
+        tool["function"]["name"]: tool["function"] for tool in workflow.module.TOOLS
+    }
+    assert set(functions) == {"dataset_info", "describe_numeric"}
+    assert [tool["function"]["name"] for tool in observation_tools] == ["dataset_info"]
+    assert functions["dataset_info"]["parameters"] == {
+        "type": "object",
+        "properties": {},
+        "required": [],
+        "additionalProperties": False,
+    }
+    parameters = functions["describe_numeric"]["parameters"]
+    assert parameters["type"] == "object"
+    assert parameters["required"] == ["columns"]
+    assert parameters["additionalProperties"] is False
+    assert set(parameters["properties"]) == {"columns"}
+    columns = parameters["properties"]["columns"]
+    assert columns["type"] == "array"
+    assert columns["items"]["type"] == "string"
+    assert columns["minItems"] == 1
+    json.dumps(workflow.module.TOOLS, allow_nan=False)
+
+
+@pytest.mark.parametrize("columns", [["sales"], ["sales", "advertising_spend"]])
+def test_descriptive_tool_end_to_end_uses_model_columns(workflow, columns, capsys):
+    workflow.csv.write_text(
+        "region,sales,advertising_spend\nEast,10,1\nWest,,3\nNorth,30,5\n",
+        encoding="utf-8",
+    )
+    original = real_load_csv(workflow.csv)
+    arguments = json.dumps({"columns": columns})
+    workflow.pending[0] = response(
+        calls=[
+            tool_call(
+                name="describe_numeric", identifier="describe_1", arguments=arguments
+            )
+        ],
+        finish_reason="tool_calls",
+    )
+    question = "请描述指定列的统计特征"
+    workflow.pending[1] = response(content="以下为模型的模拟解释。")
+    workflow.module.main(workflow.csv, question)
+    workflow.execute.assert_not_called()
+    workflow.describe.assert_called_once()
+    frame, selected = workflow.describe.call_args.args
+    assert selected == columns
+    pd.testing.assert_frame_equal(frame, original)
+    assert workflow.events == ["request", "execute", "request"]
+    first, second = workflow.requests
+    assert first["messages"][1] == {"role": "user", "content": question}
+    system = first["messages"][0]["content"]
+    metadata = json.loads(system[system.index("{") :])
+    assert metadata == {name: str(dtype) for name, dtype in original.dtypes.items()}
+    assert "East" not in system
+    assert second["messages"][:2] == first["messages"]
+    assistant, tool = second["messages"][2:]
+    assert assistant["tool_calls"] == [
+        {
+            "id": "describe_1",
+            "type": "function",
+            "function": {"name": "describe_numeric", "arguments": arguments},
+        }
+    ]
+    assert tool["role"] == "tool" and tool["tool_call_id"] == "describe_1"
+    result = json.loads(tool["content"])
+    assert result["ddof"] == 1
+    assert set(result["statistics"]) == set(columns)
+    sales = result["statistics"]["sales"]
+    assert sales == {
+        "count": 2,
+        "mean": 20.0,
+        "std": pytest.approx(200**0.5),
+        "min": 10.0,
+        "25%": 15.0,
+        "median": 20.0,
+        "75%": 25.0,
+        "max": 30.0,
+        "unavailable_statistics": [],
+    }
+    if "advertising_spend" in columns:
+        assert result["statistics"]["advertising_spend"] == {
+            "count": 3,
+            "mean": 3.0,
+            "std": 2.0,
+            "min": 1.0,
+            "25%": 2.0,
+            "median": 3.0,
+            "75%": 4.0,
+            "max": 5.0,
+            "unavailable_statistics": [],
+        }
+    assert "tools" not in second and "response_format" not in second
+    json.dumps(result, allow_nan=False)
+    assert "模型最终回答：以下为模型的模拟解释。" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        {},
+        {"columns": "sales"},
+        {"columns": []},
+        {"columns": [1]},
+        {"columns": [True]},
+        {"columns": [["sales"]]},
+        {"columns": ["sales"], "ddof": 0},
+    ],
+)
+def test_bad_describe_argument_shape_stops_before_calculation(workflow, value):
+    workflow.pending[0] = response(
+        calls=[tool_call(name="describe_numeric", arguments=json.dumps(value))],
+        finish_reason="tool_calls",
+    )
+    with pytest.raises(ValueError):
+        workflow.module.main(workflow.csv)
+    assert_no_execution_or_second_request(workflow)
+
+
+@pytest.mark.parametrize(
+    "columns", [["sales", "sales"], ["absent"], ["region"], [""], [" "]]
+)
+def test_invalid_selected_columns_use_existing_numeric_validation(workflow, columns):
+    workflow.pending[0] = response(
+        calls=[
+            tool_call(
+                name="describe_numeric", arguments=json.dumps({"columns": columns})
+            )
+        ],
+        finish_reason="tool_calls",
+    )
+    with pytest.raises(ValueError):
+        workflow.module.main(workflow.csv)
+    workflow.execute.assert_not_called()
+    workflow.describe.assert_called_once()
+    assert workflow.create.call_count == 1
+
+
+@pytest.mark.parametrize("arguments", ["not JSON", "[]", "null"])
+def test_describe_requires_json_object(workflow, arguments):
+    workflow.pending[0] = response(
+        calls=[tool_call(name="describe_numeric", arguments=arguments)],
+        finish_reason="tool_calls",
+    )
+    expected = json.JSONDecodeError if arguments == "not JSON" else ValueError
+    with pytest.raises(expected):
+        workflow.module.main(workflow.csv)
+    assert_no_execution_or_second_request(workflow)
+
+
+def test_dataset_info_does_not_accept_columns(workflow):
+    frame = real_load_csv(workflow.csv)
+    with pytest.raises(ValueError, match="不接受参数"):
+        workflow.module.execute_tool(frame, "dataset_info", '{"columns":["sales"]}')
+    workflow.execute.assert_not_called()
+    workflow.describe.assert_not_called()
+
+
+def test_model_cannot_request_unregistered_tool_with_valid_arguments(workflow):
+    frame = real_load_csv(workflow.csv)
+    with pytest.raises(ValueError, match="工具名称"):
+        workflow.module.execute_tool(frame, "group_aggregate", "{}")
+    workflow.execute.assert_not_called()
+    workflow.describe.assert_not_called()
+
+
+def test_all_missing_description_is_serialized_as_null(workflow):
+    workflow.csv.write_text("sales,region\n,A\n,B\n", encoding="utf-8")
+    workflow.pending[0] = response(
+        calls=[tool_call(name="describe_numeric", arguments='{"columns":["sales"]}')],
+        finish_reason="tool_calls",
+    )
+    workflow.module.main(workflow.csv)
+    result = json.loads(workflow.requests[1]["messages"][-1]["content"])
+    stats = result["statistics"]["sales"]
+    assert result["ddof"] == 1
+    assert stats["count"] == 0
+    for field in ["mean", "std", "min", "25%", "median", "75%", "max"]:
+        assert stats[field] is None
+        assert field in stats["unavailable_statistics"]
+    json.dumps(result, allow_nan=False)
+
+
+def test_descriptive_calculation_failure_prevents_second_round(workflow, capsys):
+    original = RuntimeError("descriptive calculation failed")
+    workflow.describe.side_effect = original
+    workflow.pending[0] = response(
+        calls=[tool_call(name="describe_numeric", arguments='{"columns":["sales"]}')],
+        finish_reason="tool_calls",
+    )
+    with pytest.raises(RuntimeError) as caught:
+        workflow.module.main(workflow.csv)
+    assert caught.value is original
+    assert workflow.create.call_count == 1
+    workflow.execute.assert_not_called()
+    assert "模型最终回答" not in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("question", ["", " \n\t"])
+def test_blank_question_prevents_reading_and_requesting(workflow, question):
+    with pytest.raises(ValueError, match="问题不能为空"):
+        workflow.module.main(workflow.csv, question)
+    workflow.read.assert_not_called()
+    workflow.create.assert_not_called()
+
+
+def test_python_function_accepts_string_but_tool_contract_requires_list(workflow):
+    frame = real_load_csv(workflow.csv)
+    assert real_describe_numeric(frame, "sales")["statistics"]["sales"]["mean"] == 20.0
+    with pytest.raises(ValueError, match="字符串数组"):
+        workflow.module.execute_tool(frame, "describe_numeric", '{"columns":"sales"}')
+    workflow.describe.assert_not_called()
