@@ -1,9 +1,11 @@
 """Offline validation of one tool execution and its two-request message chain."""
 
 import copy
+import csv
 import importlib.util
 import json
 import socket
+import statistics
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -15,6 +17,7 @@ from openai.types.chat import ChatCompletionMessageFunctionToolCall
 
 from data_copilot.analysis_tools import dataset_info as real_dataset_info
 from data_copilot.analysis_tools import describe_numeric as real_describe_numeric
+from data_copilot.analysis_tools import group_aggregate as real_group_aggregate
 from data_copilot.data_loader import load_csv as real_load_csv
 
 
@@ -70,6 +73,12 @@ def workflow(monkeypatch, tmp_path):
 
     describe_mock = Mock(side_effect=describe)
 
+    def aggregate(dataframe, **kwargs):
+        events.append("execute")
+        return real_group_aggregate(dataframe, **kwargs)
+
+    aggregate_mock = Mock(side_effect=aggregate)
+
     def submit(**kwargs):
         # Snapshot at call time: the example extends the same messages list later.
         requests.append(copy.deepcopy(kwargs))
@@ -97,6 +106,7 @@ def workflow(monkeypatch, tmp_path):
     monkeypatch.setattr(module, "load_csv", read)
     monkeypatch.setattr(module, "dataset_info", execute_mock)
     monkeypatch.setattr(module, "describe_numeric", describe_mock)
+    monkeypatch.setattr(module, "group_aggregate", aggregate_mock)
     csv_path = tmp_path / "tiny.csv"
     csv_path.write_text("region,sales\nEast,10\nWest,\nNorth,30\n", encoding="utf-8")
     return SimpleNamespace(
@@ -105,6 +115,7 @@ def workflow(monkeypatch, tmp_path):
         constructor=constructor,
         execute=execute_mock,
         describe=describe_mock,
+        aggregate=aggregate_mock,
         read=read,
         pending=pending,
         requests=requests,
@@ -117,6 +128,7 @@ def workflow(monkeypatch, tmp_path):
 def assert_no_execution_or_second_request(workflow):
     workflow.execute.assert_not_called()
     workflow.describe.assert_not_called()
+    workflow.aggregate.assert_not_called()
     assert workflow.create.call_count == 1
 
 
@@ -125,6 +137,7 @@ def test_import_has_no_io(workflow):
     workflow.create.assert_not_called()
     workflow.execute.assert_not_called()
     workflow.describe.assert_not_called()
+    workflow.aggregate.assert_not_called()
     workflow.read.assert_not_called()
     workflow.dotenv.assert_not_called()
 
@@ -396,13 +409,13 @@ def test_blank_final_answer_is_rejected(workflow, content):
         workflow.module.main(workflow.csv)
 
 
-def test_two_tool_schemas_do_not_change_task08_tool_definitions(workflow):
+def test_three_tool_schemas_do_not_change_task08_tool_definitions(workflow):
     from examples.tool_calling import TOOLS as observation_tools
 
     functions = {
         tool["function"]["name"]: tool["function"] for tool in workflow.module.TOOLS
     }
-    assert set(functions) == {"dataset_info", "describe_numeric"}
+    assert set(functions) == {"dataset_info", "describe_numeric", "group_aggregate"}
     assert [tool["function"]["name"] for tool in observation_tools] == ["dataset_info"]
     assert functions["dataset_info"]["parameters"] == {
         "type": "object",
@@ -559,7 +572,7 @@ def test_dataset_info_does_not_accept_columns(workflow):
 def test_model_cannot_request_unregistered_tool_with_valid_arguments(workflow):
     frame = real_load_csv(workflow.csv)
     with pytest.raises(ValueError, match="工具名称"):
-        workflow.module.execute_tool(frame, "group_aggregate", "{}")
+        workflow.module.execute_tool(frame, "correlation", "{}")
     workflow.execute.assert_not_called()
     workflow.describe.assert_not_called()
 
@@ -610,3 +623,282 @@ def test_python_function_accepts_string_but_tool_contract_requires_list(workflow
     with pytest.raises(ValueError, match="字符串数组"):
         workflow.module.execute_tool(frame, "describe_numeric", '{"columns":"sales"}')
     workflow.describe.assert_not_called()
+
+
+def test_group_schema_has_exact_required_arguments_and_enum(workflow):
+    tools = {
+        tool["function"]["name"]: tool["function"] for tool in workflow.module.TOOLS
+    }
+    parameters = tools["group_aggregate"]["parameters"]
+    names = {"group_column", "target_column", "aggregation"}
+    assert parameters["type"] == "object"
+    assert set(parameters["properties"]) == names
+    assert set(parameters["required"]) == names
+    assert parameters["additionalProperties"] is False
+    for name in names:
+        assert parameters["properties"][name]["type"] == "string"
+    assert set(parameters["properties"]["aggregation"]["enum"]) == {
+        "mean",
+        "sum",
+        "count",
+        "min",
+        "max",
+    }
+
+
+@pytest.mark.parametrize(
+    "aggregation,values",
+    [
+        ("mean", [15.0, 30.0, None, 0.0]),
+        ("sum", [30.0, 30.0, None, 0.0]),
+        ("count", [2, 1, 0, 1]),
+        ("min", [10.0, 30.0, None, 0.0]),
+        ("max", [20.0, 30.0, None, 0.0]),
+    ],
+)
+def test_group_end_to_end_preserves_missing_keys_and_values(
+    workflow, aggregation, values, capsys
+):
+    workflow.csv.write_text(
+        "region,sales,category\nA,10,X\nA,20,Y\nA,,X\n,30,X\nB,,Y\nC,0,X\n",
+        encoding="utf-8",
+    )
+    original = real_load_csv(workflow.csv)
+    arguments = json.dumps(
+        {
+            "group_column": "region",
+            "target_column": "sales",
+            "aggregation": aggregation,
+        }
+    )
+    workflow.pending[0] = response(
+        calls=[
+            tool_call(
+                name="group_aggregate",
+                identifier="group_call",
+                arguments=arguments,
+            )
+        ],
+        finish_reason="tool_calls",
+    )
+    workflow.pending[1] = response(content="模拟解释，不用于评估模型回答质量。")
+    question = "请按地区汇总销售额"
+    workflow.module.main(workflow.csv, question)
+    workflow.execute.assert_not_called()
+    workflow.describe.assert_not_called()
+    workflow.aggregate.assert_called_once()
+    frame = workflow.aggregate.call_args.args[0]
+    pd.testing.assert_frame_equal(frame, original)
+    assert workflow.aggregate.call_args.kwargs == {
+        "group_column": "region",
+        "target_column": "sales",
+        "aggregation": aggregation,
+    }
+    assert workflow.events == ["request", "execute", "request"]
+    first, second = workflow.requests
+    assert first["messages"][1] == {"role": "user", "content": question}
+    system = first["messages"][0]["content"]
+    metadata = json.loads(system[system.index("{") :])
+    assert metadata == {name: str(dtype) for name, dtype in original.dtypes.items()}
+    assert second["messages"][:2] == first["messages"]
+    assistant, tool = second["messages"][2:]
+    assert assistant["tool_calls"] == [
+        {
+            "id": "group_call",
+            "type": "function",
+            "function": {"name": "group_aggregate", "arguments": arguments},
+        }
+    ]
+    assert tool["role"] == "tool" and tool["tool_call_id"] == "group_call"
+    result = json.loads(tool["content"])
+    assert result == {
+        "group_column": "region",
+        "target_column": "sales",
+        "aggregation": aggregation,
+        "groups": [
+            {
+                "group": key,
+                "value": value,
+                "status": "ok" if value is not None else "undefined_or_nonfinite",
+            }
+            for key, value in zip(["A", None, "B", "C"], values, strict=True)
+        ],
+    }
+    # B has one missing target; C has a genuine zero. These must stay distinct.
+    assert result["groups"][2]["value"] == (0 if aggregation == "count" else None)
+    assert result["groups"][3]["value"] == (1 if aggregation == "count" else 0)
+    assert "tools" not in second and "response_format" not in second
+    json.dumps(result, allow_nan=False)
+    assert "模型最终回答：模拟解释" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    "group_column,aggregation",
+    [
+        ("region", "mean"),
+        ("category", "sum"),
+        ("region", "count"),
+    ],
+)
+def test_real_sales_group_results_match_independent_csv_calculation(
+    workflow, group_column, aggregation
+):
+    path = Path(__file__).resolve().parents[1] / "data/samples/sales.csv"
+    arguments = json.dumps(
+        {
+            "group_column": group_column,
+            "target_column": "sales",
+            "aggregation": aggregation,
+        }
+    )
+    workflow.pending[0] = response(
+        calls=[tool_call(name="group_aggregate", arguments=arguments)],
+        finish_reason="tool_calls",
+    )
+    workflow.module.main(path)
+    result = json.loads(workflow.requests[1]["messages"][-1]["content"])
+    grouped = {}
+    with path.open(encoding="utf-8", newline="") as source:
+        for row in csv.DictReader(source):
+            values = grouped.setdefault(row[group_column] or None, [])
+            if row["sales"]:
+                values.append(float(row["sales"]))
+    assert [item["group"] for item in result["groups"]] == list(grouped)
+    for item in result["groups"]:
+        values = grouped[item["group"]]
+        expected = (
+            len(values)
+            if aggregation == "count"
+            else sum(values)
+            if aggregation == "sum"
+            else statistics.mean(values)
+        )
+        assert item["value"] == pytest.approx(expected)
+        assert item["status"] == "ok"
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        {},
+        {"group_column": "region", "target_column": "sales"},
+        {"group_column": "region", "aggregation": "mean"},
+        {"target_column": "sales", "aggregation": "mean"},
+        {
+            "group_column": "region",
+            "target_column": "sales",
+            "aggregation": "mean",
+            "ddof": 0,
+        },
+    ],
+)
+def test_missing_or_extra_group_fields_prevent_calculation(workflow, arguments):
+    workflow.pending[0] = response(
+        calls=[
+            tool_call(
+                name="group_aggregate",
+                arguments=json.dumps(arguments),
+            )
+        ],
+        finish_reason="tool_calls",
+    )
+    with pytest.raises(ValueError, match="三个必填参数"):
+        workflow.module.main(workflow.csv)
+    assert_no_execution_or_second_request(workflow)
+
+
+@pytest.mark.parametrize("field", ["group_column", "target_column", "aggregation"])
+@pytest.mark.parametrize("value", [None, 1, True, []])
+def test_group_argument_types_are_strict(workflow, field, value):
+    arguments = {
+        "group_column": "region",
+        "target_column": "sales",
+        "aggregation": "mean",
+    }
+    arguments[field] = value
+    workflow.pending[0] = response(
+        calls=[
+            tool_call(
+                name="group_aggregate",
+                arguments=json.dumps(arguments),
+            )
+        ],
+        finish_reason="tool_calls",
+    )
+    with pytest.raises(ValueError, match="必须是字符串"):
+        workflow.module.main(workflow.csv)
+    assert_no_execution_or_second_request(workflow)
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("group_column", "unknown"),
+        ("target_column", "unknown"),
+        ("group_column", ""),
+        ("target_column", " "),
+        ("target_column", "region"),
+        ("aggregation", "median"),
+        ("aggregation", "MEAN"),
+        ("aggregation", ""),
+    ],
+)
+def test_group_semantics_are_checked_by_real_tool(workflow, field, value):
+    arguments = {
+        "group_column": "region",
+        "target_column": "sales",
+        "aggregation": "mean",
+    }
+    arguments[field] = value
+    workflow.pending[0] = response(
+        calls=[
+            tool_call(
+                name="group_aggregate",
+                arguments=json.dumps(arguments),
+            )
+        ],
+        finish_reason="tool_calls",
+    )
+    with pytest.raises(ValueError):
+        workflow.module.main(workflow.csv)
+    workflow.execute.assert_not_called()
+    workflow.describe.assert_not_called()
+    workflow.aggregate.assert_called_once()
+    assert workflow.create.call_count == 1
+
+
+@pytest.mark.parametrize("arguments", ["not JSON", "[]", "null"])
+def test_group_arguments_must_be_json_object(workflow, arguments):
+    workflow.pending[0] = response(
+        calls=[
+            tool_call(
+                name="group_aggregate",
+                arguments=arguments,
+            )
+        ],
+        finish_reason="tool_calls",
+    )
+    expected = json.JSONDecodeError if arguments == "not JSON" else ValueError
+    with pytest.raises(expected):
+        workflow.module.main(workflow.csv)
+    assert_no_execution_or_second_request(workflow)
+
+
+def test_group_failure_is_preserved_without_second_request(workflow, capsys):
+    original = RuntimeError("group calculation failed")
+    workflow.aggregate.side_effect = original
+    arguments = '{"group_column":"region","target_column":"sales","aggregation":"mean"}'
+    workflow.pending[0] = response(
+        calls=[
+            tool_call(
+                name="group_aggregate",
+                arguments=arguments,
+            )
+        ],
+        finish_reason="tool_calls",
+    )
+    with pytest.raises(RuntimeError) as caught:
+        workflow.module.main(workflow.csv)
+    assert caught.value is original
+    assert workflow.create.call_count == 1
+    assert "模型最终回答" not in capsys.readouterr().out

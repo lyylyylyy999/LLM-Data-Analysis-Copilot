@@ -19,7 +19,11 @@ from dotenv import load_dotenv
 from openai import OpenAI
 from openai.types.chat import ChatCompletionMessageParam, ChatCompletionToolParam
 
-from data_copilot.analysis_tools import dataset_info, describe_numeric
+from data_copilot.analysis_tools import (
+    dataset_info,
+    describe_numeric,
+    group_aggregate,
+)
 from data_copilot.data_loader import load_csv
 from examples.tool_calling import QUESTION
 from examples.tool_calling import TOOLS as TASK08_TOOLS
@@ -51,6 +55,40 @@ TOOLS: list[ChatCompletionToolParam] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "group_aggregate",
+            "description": (
+                "按指定字段分组，对数值字段执行 mean、sum、count、min 或 max。"
+                "count 仅统计目标列的非缺失值；缺失的分组键保留为 null；"
+                "目标值全部缺失的组，其 sum 为 null 而非 0。"
+                "数据由 Python 管理，无需传入 DataFrame。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "group_column": {
+                        "type": "string",
+                        "description": "用于分组的列名，如 region 或 category。",
+                    },
+                    "target_column": {
+                        "type": "string",
+                        "description": "需要聚合的数值列名，如 sales。",
+                    },
+                    "aggregation": {
+                        "type": "string",
+                        "enum": ["mean", "sum", "count", "min", "max"],
+                        "description": (
+                            "聚合方式：平均值、总和、非缺失计数、最小值或最大值。"
+                        ),
+                    },
+                },
+                "required": ["group_column", "target_column", "aggregation"],
+                "additionalProperties": False,
+            },
+        },
+    },
 ]
 
 SYSTEM_PROMPT = (
@@ -58,22 +96,28 @@ SYSTEM_PROMPT = (
     "你只知道下方列名及数据类型，不知道数据值或统计结果。"
     "询问行数或列数时使用 dataset_info；询问数值列的描述统计时"
     "使用 describe_numeric，并将指定列名放进 columns 数组。"
+    "询问按地区、商品类别等分组的聚合结果时使用 group_aggregate，"
+    "准确填写 group_column、target_column 和 aggregation。"
+    "平均值选 mean，总和选 sum，非缺失目标值数量选 count，"
+    "最小值选 min，最大值选 max。"
     "实际执行工具之前不得猜测统计结果。"
     "只依据 Python 工具返回的结果回答：描述统计的 count 是非缺失值数量，"
     "缺失值不参与统计；标准差采用 ddof=1（样本标准差）。"
     "如未提供总行数，不要根据 count 推断缺失值的具体数量。"
-    "不将描述统计或相关关系解释为因果关系。"
+    "group_aggregate 的 count 仅统计目标列的非缺失值，不是组内总行数；"
+    "缺失分组键会以 null 保留，不能忽略；全缺失组的 sum 为 null，不能当作 0。"
+    "不将描述统计或分组差异解释为因果关系。"
 )
 
 
 def execute_tool(
     dataframe: pd.DataFrame, tool_name: str, arguments_json: str
 ) -> dict[str, Any]:
-    """只分发两种白名单工具；不信任模型提供的 JSON 参数。"""
-    if tool_name not in {"dataset_info", "describe_numeric"}:
+    """白名单分发三种工具；严格验证参数后交由真实统计函数执行。"""
+    if tool_name not in {"dataset_info", "describe_numeric", "group_aggregate"}:
         raise ValueError(f"不支持的工具名称：{tool_name}")
 
-    # 非法 JSON 直接保留 JSONDecodeError；JSON 数组、null 等均拒绝。
+    # 无效 JSON 原样抛出 JSONDecodeError；数组、null 等非对象也应拒绝。
     arguments = json.loads(arguments_json)
     if not isinstance(arguments, dict):
         raise ValueError("工具调用 arguments 必须是 JSON 对象")
@@ -83,18 +127,33 @@ def execute_tool(
             raise ValueError(f"dataset_info 不接受参数：{arguments}")
         return dataset_info(dataframe)
 
-    if set(arguments) != {"columns"}:
-        raise ValueError("describe_numeric 必须且只能包含 columns 参数")
-    columns = arguments["columns"]
-    if not isinstance(columns, list):
-        raise ValueError("columns 必须是字符串数组，不能是单个字符串")
-    if not columns:
-        raise ValueError("columns 至少包含一个列名")
-    if any(not isinstance(column, str) for column in columns):
-        raise ValueError("columns 中的每个列名都必须是字符串")
+    if tool_name == "describe_numeric":
+        if set(arguments) != {"columns"}:
+            raise ValueError("describe_numeric 必须且只能包含 columns 参数")
+        columns = arguments["columns"]
+        if not isinstance(columns, list):
+            raise ValueError("columns 必须是字符串数组，不能是单个字符串")
+        if not columns:
+            raise ValueError("columns 至少包含一个列名")
+        if any(not isinstance(column, str) for column in columns):
+            raise ValueError("columns 中的每个列名都必须是字符串")
 
-    # 复用现有工具对空白名称、重复名称、未知列、非数值列的校验。
-    return describe_numeric(dataframe, cast(list[str], columns))
+        # 复用统计函数对空白、重复、未知及非数值列的校验。
+        return describe_numeric(dataframe, cast(list[str], columns))
+
+    required = {"group_column", "target_column", "aggregation"}
+    if set(arguments) != required:
+        raise ValueError("group_aggregate 必须且只能包含三个必填参数")
+    if any(not isinstance(arguments[name], str) for name in required):
+        raise ValueError("group_aggregate 的三个参数都必须是字符串")
+
+    # 现有统计函数校验列是否存在、目标类型与聚合方法的允许值。
+    return group_aggregate(
+        dataframe,
+        group_column=arguments["group_column"],
+        target_column=arguments["target_column"],
+        aggregation=arguments["aggregation"],
+    )
 
 
 def main(csv_path: Path, question: str = QUESTION) -> None:
