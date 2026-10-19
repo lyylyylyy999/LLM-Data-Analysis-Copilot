@@ -1,4 +1,4 @@
-"""选择并执行一次数据分析工具，将真实结果交回模型生成中文回答。
+"""顺序执行同一轮的多个数据分析工具，将真实结果交回模型生成中文回答。
 
 从项目根目录运行：
     python -m examples.tool_execution --csv data/samples/sales.csv
@@ -14,7 +14,7 @@ import argparse
 import json
 import os
 from pathlib import Path
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import pandas as pd
 from dotenv import load_dotenv
@@ -30,6 +30,9 @@ from data_copilot.analysis_tools import (
 from data_copilot.data_loader import load_csv
 from examples.tool_calling import QUESTION
 from examples.tool_calling import TOOLS as TASK08_TOOLS
+
+if TYPE_CHECKING:
+    from openai.types.chat import ChatCompletionMessageFunctionToolCall
 
 TOOLS: list[ChatCompletionToolParam] = [
     *TASK08_TOOLS,
@@ -150,6 +153,9 @@ SYSTEM_PROMPT = (
     "相关关系不等于因果关系，不能据此证明广告导致销售额提高。"
     "该工具未返回 p 值或置信区间，不得声称已完成显著性检验。"
     "不将描述统计或分组差异解释为因果关系。"
+    "复合问题必须在第一轮一次性请求全部必要工具；"
+    "同一工具也可按不同参数多次请求，不要留待后续轮次再请求。"
+    "收到工具执行结果后，直接根据已有结果回答，不要再次请求工具。"
 )
 
 
@@ -253,12 +259,14 @@ def main(csv_path: Path, question: str = QUESTION) -> None:
         {"role": "user", "content": question},
     ]
 
-    # 第一轮：只提供字段元数据及工具 Schema，不提供统计数据。
+    # 第一轮允许模型一次返回多个独立工具请求；Python 仍按顺序执行。
+    # 只提供字段元数据及工具 Schema，不提前提供统计数据。
     first_response = client.chat.completions.create(
         model=model,
         messages=messages.copy(),
         tools=TOOLS,
         tool_choice="auto",
+        parallel_tool_calls=True,
         extra_body={"enable_thinking": False},
         stream=False,
     )
@@ -288,53 +296,81 @@ def main(csv_path: Path, question: str = QUESTION) -> None:
 
     if first_choice.finish_reason != "tool_calls":
         raise RuntimeError("第一轮返回了工具调用，但结束原因不是 tool_calls")
-    if len(tool_calls) != 1:
-        raise ValueError(f"本任务只支持一次工具调用，实际为 {len(tool_calls)} 次")
+    # 先统一检查整批调用的类型和 ID，任何工具执行之前就拒绝不合法的批次。
+    seen_ids: set[str] = set()
+    function_calls: list[ChatCompletionMessageFunctionToolCall] = []
+    for tool_call in tool_calls:
+        if tool_call.type != "function":
+            raise ValueError(f"不支持的工具调用类型：{tool_call.type}")
+        if not isinstance(tool_call.id, str) or not tool_call.id.strip():
+            raise ValueError("工具调用 ID 必须是非空字符串")
+        if tool_call.id in seen_ids:
+            raise ValueError(f"工具调用 ID 重复：{tool_call.id}")
+        seen_ids.add(tool_call.id)
+        # 已检查 type == "function"，在此收窄 SDK 的联合类型。
+        function_calls.append(cast("ChatCompletionMessageFunctionToolCall", tool_call))
 
-    tool_call = tool_calls[0]
-    if tool_call.type != "function":
-        raise ValueError(f"不支持的工具调用类型：{tool_call.type}")
-    if not isinstance(tool_call.id, str) or not tool_call.id.strip():
-        raise ValueError("工具调用 ID 不能为空")
-
+    print(f"第一轮工具调用数量：{len(function_calls)}")
     print("第一轮工具调用请求：")
-    print(json.dumps([tool_call.model_dump(exclude_none=True)], ensure_ascii=False))
-
-    # 校验/执行期间出现的异常直接传播；不生成伪造的工具结果。
-    result = execute_tool(
-        dataframe, tool_call.function.name, tool_call.function.arguments
+    print(
+        json.dumps(
+            [call.model_dump(exclude_none=True) for call in tool_calls],
+            ensure_ascii=False,
+        )
     )
-    result_json = json.dumps(result, ensure_ascii=False, allow_nan=False)
-    print("Python 实际执行的工具结果：")
-    print(result_json)
 
+    # assistant 消息必须包含整批工具调用，而不是拆成多条 assistant 消息。
     assistant_message: ChatCompletionMessageParam = {
         "role": "assistant",
         "content": first_message.content,
         "tool_calls": [
             {
-                "id": tool_call.id,
+                "id": call.id,
                 "type": "function",
                 "function": {
-                    "name": tool_call.function.name,
-                    "arguments": tool_call.function.arguments,
+                    "name": call.function.name,
+                    "arguments": call.function.arguments,
                 },
             }
+            for call in function_calls
         ],
     }
-    tool_message: ChatCompletionMessageParam = {
-        "role": "tool",
-        "tool_call_id": tool_call.id,
-        "content": result_json,
-    }
-    print("回传的 tool 消息：")
-    print(json.dumps(tool_message, ensure_ascii=False))
-    messages.extend([assistant_message, tool_message])
 
-    # 第二轮：复用 system → user → assistant(tool_calls) → tool，不再提供工具。
+    tool_messages: list[ChatCompletionMessageParam] = []
+    for index, tool_call in enumerate(function_calls, start=1):
+        print(
+            f"工具调用 {index}：ID={tool_call.id}，"
+            f"名称={tool_call.function.name}，"
+            f"arguments={tool_call.function.arguments}"
+        )
+        # 参数校验、工具执行和 JSON 序列化中的异常直接传播。
+        # 不伪造结果，也不会发送第二轮请求。
+        result = execute_tool(
+            dataframe, tool_call.function.name, tool_call.function.arguments
+        )
+        result_json = json.dumps(result, ensure_ascii=False, allow_nan=False)
+        print(f"Python 实际执行的工具结果（{tool_call.id}）：")
+        print(result_json)
+
+        tool_message: ChatCompletionMessageParam = {
+            "role": "tool",
+            "tool_call_id": tool_call.id,
+            "content": result_json,
+        }
+        tool_messages.append(tool_message)
+        print("回传的 tool 消息：")
+        print(json.dumps(tool_message, ensure_ascii=False))
+
+    # 全部调用成功后，按模型请求顺序回传每一条工具结果。
+    messages.append(assistant_message)
+    messages.extend(tool_messages)
+
+    # 第二轮显式禁止工具调用；仅允许根据已回传的结果生成正文。
     second_response = client.chat.completions.create(
         model=model,
         messages=messages,
+        tools=TOOLS,
+        tool_choice="none",
         extra_body={"enable_thinking": False},
         stream=False,
     )
@@ -344,6 +380,19 @@ def main(csv_path: Path, question: str = QUESTION) -> None:
     second_choice = second_response.choices[0]
     print(f"第二轮结束原因：{second_choice.finish_reason}")
     if second_choice.finish_reason != "stop":
+        if second_choice.message.tool_calls:
+            print("第二轮意外返回的工具调用：")
+            print(
+                json.dumps(
+                    [
+                        call.model_dump(exclude_none=True)
+                        for call in second_choice.message.tool_calls
+                    ],
+                    ensure_ascii=False,
+                )
+            )
+        if second_choice.message.content:
+            print(f"第二轮异常正文：{second_choice.message.content}")
         raise RuntimeError(f"第二轮模型未正常结束：{second_choice.finish_reason}")
     if second_choice.message.refusal:
         raise RuntimeError(f"第二轮模型拒绝回答：{second_choice.message.refusal}")

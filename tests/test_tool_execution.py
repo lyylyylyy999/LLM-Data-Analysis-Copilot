@@ -1,4 +1,4 @@
-"""Offline validation of one tool execution and its two-request message chain."""
+"""Offline validation of tool execution batches and their two-request message chain."""
 
 import copy
 import csv
@@ -142,6 +142,173 @@ def assert_no_execution_or_second_request(workflow):
     assert workflow.create.call_count == 1
 
 
+def assert_batch_message_chain(workflow, calls, expected_results):
+    first, second = workflow.requests
+    assert first["parallel_tool_calls"] is True
+    assert second["tool_choice"] == "none"
+    assert second["messages"][:2] == first["messages"]
+    assistant, *results = second["messages"][2:]
+    assert assistant == {
+        "role": "assistant",
+        "content": "准备执行整批分析",
+        "tool_calls": [call.model_dump() for call in calls],
+    }
+    assert len(results) == len(calls) == len(expected_results)
+    for call, message, expected in zip(calls, results, expected_results, strict=True):
+        assert message == {
+            "role": "tool",
+            "tool_call_id": call.id,
+            "content": json.dumps(expected, ensure_ascii=False, allow_nan=False),
+        }
+    assert workflow.events == ["request", *["execute"] * len(calls), "request"]
+    assert workflow.create.call_count == 2
+    json.dumps(second, allow_nan=False)
+
+
+def test_batch_of_different_tools_preserves_messages_and_results(workflow, capsys):
+    workflow.csv.write_text("region,sales,ads\nEast,10,1\nWest,20,2\nEast,30,3\n")
+    calls = [
+        tool_call(identifier="info", arguments="{ }"),
+        tool_call(
+            identifier="describe",
+            name="describe_numeric",
+            arguments='{"columns": ["sales"]}',
+        ),
+        tool_call(
+            identifier="corr",
+            name="correlation",
+            arguments='{"x_column":"sales","y_column":"ads","method":"pearson"}',
+        ),
+    ]
+    workflow.pending[0] = response(
+        calls=calls, content="准备执行整批分析", finish_reason="tool_calls"
+    )
+    before = real_load_csv(workflow.csv)
+    workflow.module.main(workflow.csv, "数据规模、销售额统计及广告相关性？")
+    expected = [
+        real_dataset_info(before),
+        real_describe_numeric(before, ["sales"]),
+        real_correlation(before, "sales", "ads"),
+    ]
+    assert_batch_message_chain(workflow, calls, expected)
+    assert expected[0]["row_count"] == 3
+    assert expected[1]["statistics"]["sales"]["mean"] == 20
+    assert expected[2]["coefficient"] == pytest.approx(1)
+    workflow.aggregate.assert_not_called()
+    for mock in (workflow.execute, workflow.describe, workflow.correlate):
+        mock.assert_called_once()
+        pd.testing.assert_frame_equal(mock.call_args.args[0], before)
+    output = capsys.readouterr().out
+    for call in calls:
+        assert f"ID={call.id}" in output
+        assert f"名称={call.function.name}" in output
+
+
+@pytest.mark.parametrize("same_arguments", [False, True])
+def test_same_tool_multiple_times_is_not_deduplicated(workflow, same_arguments):
+    workflow.csv.write_text("region,category,sales\nEast,A,10\nWest,A,20\nEast,B,30\n")
+    arguments = [
+        {"group_column": "region", "target_column": "sales", "aggregation": "mean"},
+        {"group_column": "category", "target_column": "sales", "aggregation": "sum"},
+    ]
+    if same_arguments:
+        arguments[1] = arguments[0].copy()
+    calls = [
+        tool_call(
+            name="group_aggregate", identifier=f"group_{i}", arguments=json.dumps(a)
+        )
+        for i, a in enumerate(arguments)
+    ]
+    workflow.pending[0] = response(
+        calls=calls, content="准备执行整批分析", finish_reason="tool_calls"
+    )
+    workflow.module.main(workflow.csv)
+    before = real_load_csv(workflow.csv)
+    expected = [real_group_aggregate(before, **a) for a in arguments]
+    assert_batch_message_chain(workflow, calls, expected)
+    assert workflow.aggregate.call_count == 2
+    for actual, requested in zip(
+        workflow.aggregate.call_args_list, arguments, strict=True
+    ):
+        assert actual.kwargs == requested
+        pd.testing.assert_frame_equal(actual.args[0], before)
+
+
+@pytest.mark.parametrize("identifier", [None, "", " \t", 123, True])
+def test_later_invalid_id_prevents_any_batch_execution(workflow, identifier):
+    bad = SimpleNamespace(type="function", id=identifier)
+    workflow.pending[0] = response(calls=[tool_call(), bad], finish_reason="tool_calls")
+    with pytest.raises(ValueError, match="ID"):
+        workflow.module.main(workflow.csv)
+    assert_no_execution_or_second_request(workflow)
+
+
+def test_later_invalid_type_prevents_any_batch_execution(workflow):
+    workflow.pending[0] = response(
+        calls=[tool_call(), SimpleNamespace(type="custom")], finish_reason="tool_calls"
+    )
+    with pytest.raises(ValueError, match="调用类型"):
+        workflow.module.main(workflow.csv)
+    assert_no_execution_or_second_request(workflow)
+
+
+def test_nonadjacent_duplicate_id_prevents_any_batch_execution(workflow):
+    workflow.pending[0] = response(
+        calls=[tool_call(), tool_call(identifier="other"), tool_call()],
+        finish_reason="tool_calls",
+    )
+    with pytest.raises(ValueError, match="ID.*重复"):
+        workflow.module.main(workflow.csv)
+    assert_no_execution_or_second_request(workflow)
+
+
+@pytest.mark.parametrize("failure_index", [0, 1, 2])
+@pytest.mark.parametrize(
+    "failure_kind", ["json", "unknown", "columns", "calculation", "serialize"]
+)
+def test_batch_failure_stops_remaining_execution_and_second_request(
+    workflow, monkeypatch, failure_index, failure_kind, capsys
+):
+    calls = [tool_call(identifier=f"call_{i}") for i in range(3)]
+    original = None
+    if failure_kind == "json":
+        calls[failure_index].function.arguments = "invalid JSON"
+        expected_error = json.JSONDecodeError
+    elif failure_kind == "unknown":
+        calls[failure_index].function.name = "unknown_tool"
+        expected_error = ValueError
+    elif failure_kind == "columns":
+        calls[failure_index].function.name = "describe_numeric"
+        calls[failure_index].function.arguments = '{"columns":["absent"]}'
+        expected_error = ValueError
+    else:
+        expected_error = ValueError
+        original = ValueError("batch calculation failed")
+    workflow.pending[0] = response(calls=calls, finish_reason="tool_calls")
+    actual_execute = workflow.module.execute_tool
+    attempted = []
+
+    def tracking_execute(dataframe, name, arguments):
+        index = len(attempted)
+        attempted.append(name)
+        if index == failure_index and failure_kind == "calculation":
+            raise original
+        result = actual_execute(dataframe, name, arguments)
+        if index == failure_index and failure_kind == "serialize":
+            return {"invalid": float("nan")}
+        return result
+
+    monkeypatch.setattr(workflow.module, "execute_tool", tracking_execute)
+    with pytest.raises(expected_error) as caught:
+        workflow.module.main(workflow.csv)
+    if failure_kind == "calculation":
+        assert caught.value is original
+    assert len(attempted) == failure_index + 1
+    assert workflow.create.call_count == 1
+    assert len(workflow.requests[0]["messages"]) == 2
+    assert "模型最终回答" not in capsys.readouterr().out
+
+
 def test_import_has_no_io(workflow):
     workflow.constructor.assert_not_called()
     workflow.create.assert_not_called()
@@ -186,7 +353,8 @@ def test_complete_message_chain_uses_real_dataframe(workflow, capsys):
     assert metadata == {name: str(dtype) for name, dtype in dataframe.dtypes.items()}
     assert first["messages"][1] == {"role": "user", "content": workflow.module.QUESTION}
     assert "East" not in system and "North" not in system
-    assert "tools" not in second and "tool_choice" not in second
+    assert second["tools"] == workflow.module.TOOLS
+    assert second["tool_choice"] == "none"
     assert "response_format" not in first and "response_format" not in second
     assert second["messages"][:2] == first["messages"]
     assert len(second["messages"]) == 4
@@ -266,11 +434,11 @@ def test_inconsistent_first_response_prevents_execution(workflow, calls, reason)
     assert_no_execution_or_second_request(workflow)
 
 
-def test_multiple_calls_are_not_partially_executed(workflow):
+def test_duplicate_ids_prevent_entire_batch_execution(workflow):
     workflow.pending[0] = response(
-        calls=[tool_call(), tool_call(identifier="call_2")], finish_reason="tool_calls"
+        calls=[tool_call(), tool_call()], finish_reason="tool_calls"
     )
-    with pytest.raises(ValueError, match="只支持一次工具调用"):
+    with pytest.raises(ValueError, match="ID.*重复"):
         workflow.module.main(workflow.csv)
     assert_no_execution_or_second_request(workflow)
 
@@ -519,7 +687,9 @@ def test_descriptive_tool_end_to_end_uses_model_columns(workflow, columns, capsy
             "max": 5.0,
             "unavailable_statistics": [],
         }
-    assert "tools" not in second and "response_format" not in second
+    assert second["tools"] == workflow.module.TOOLS
+    assert second["tool_choice"] == "none"
+    assert "response_format" not in second
     json.dumps(result, allow_nan=False)
     assert "模型最终回答：以下为模型的模拟解释。" in capsys.readouterr().out
 
@@ -743,7 +913,9 @@ def test_group_end_to_end_preserves_missing_keys_and_values(
     # B has one missing target; C has a genuine zero. These must stay distinct.
     assert result["groups"][2]["value"] == (0 if aggregation == "count" else None)
     assert result["groups"][3]["value"] == (1 if aggregation == "count" else 0)
-    assert "tools" not in second and "response_format" not in second
+    assert second["tools"] == workflow.module.TOOLS
+    assert second["tool_choice"] == "none"
+    assert "response_format" not in second
     json.dumps(result, allow_nan=False)
     assert "模型最终回答：模拟解释" in capsys.readouterr().out
 
@@ -982,7 +1154,9 @@ def run_correlation_case(workflow, *, x_column="x", y_column="y"):
         }
     ]
     assert tool["role"] == "tool" and tool["tool_call_id"] == "correlation_id"
-    assert "tools" not in second and "response_format" not in second
+    assert second["tools"] == workflow.module.TOOLS
+    assert second["tool_choice"] == "none"
+    assert "response_format" not in second
     result = json.loads(tool["content"])
     assert set(result) == {
         "x_column",
