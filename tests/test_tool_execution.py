@@ -15,6 +15,7 @@ import pytest
 from openai import OpenAIError
 from openai.types.chat import ChatCompletionMessageFunctionToolCall
 
+from data_copilot.analysis_tools import correlation as real_correlation
 from data_copilot.analysis_tools import dataset_info as real_dataset_info
 from data_copilot.analysis_tools import describe_numeric as real_describe_numeric
 from data_copilot.analysis_tools import group_aggregate as real_group_aggregate
@@ -79,6 +80,12 @@ def workflow(monkeypatch, tmp_path):
 
     aggregate_mock = Mock(side_effect=aggregate)
 
+    def correlate(dataframe, **kwargs):
+        events.append("execute")
+        return real_correlation(dataframe, **kwargs)
+
+    correlate_mock = Mock(side_effect=correlate)
+
     def submit(**kwargs):
         # Snapshot at call time: the example extends the same messages list later.
         requests.append(copy.deepcopy(kwargs))
@@ -107,6 +114,7 @@ def workflow(monkeypatch, tmp_path):
     monkeypatch.setattr(module, "dataset_info", execute_mock)
     monkeypatch.setattr(module, "describe_numeric", describe_mock)
     monkeypatch.setattr(module, "group_aggregate", aggregate_mock)
+    monkeypatch.setattr(module, "correlation", correlate_mock)
     csv_path = tmp_path / "tiny.csv"
     csv_path.write_text("region,sales\nEast,10\nWest,\nNorth,30\n", encoding="utf-8")
     return SimpleNamespace(
@@ -116,6 +124,7 @@ def workflow(monkeypatch, tmp_path):
         execute=execute_mock,
         describe=describe_mock,
         aggregate=aggregate_mock,
+        correlate=correlate_mock,
         read=read,
         pending=pending,
         requests=requests,
@@ -129,6 +138,7 @@ def assert_no_execution_or_second_request(workflow):
     workflow.execute.assert_not_called()
     workflow.describe.assert_not_called()
     workflow.aggregate.assert_not_called()
+    workflow.correlate.assert_not_called()
     assert workflow.create.call_count == 1
 
 
@@ -138,6 +148,7 @@ def test_import_has_no_io(workflow):
     workflow.execute.assert_not_called()
     workflow.describe.assert_not_called()
     workflow.aggregate.assert_not_called()
+    workflow.correlate.assert_not_called()
     workflow.read.assert_not_called()
     workflow.dotenv.assert_not_called()
 
@@ -409,13 +420,18 @@ def test_blank_final_answer_is_rejected(workflow, content):
         workflow.module.main(workflow.csv)
 
 
-def test_three_tool_schemas_do_not_change_task08_tool_definitions(workflow):
+def test_four_tool_schemas_do_not_change_task08_tool_definitions(workflow):
     from examples.tool_calling import TOOLS as observation_tools
 
     functions = {
         tool["function"]["name"]: tool["function"] for tool in workflow.module.TOOLS
     }
-    assert set(functions) == {"dataset_info", "describe_numeric", "group_aggregate"}
+    assert set(functions) == {
+        "dataset_info",
+        "describe_numeric",
+        "group_aggregate",
+        "correlation",
+    }
     assert [tool["function"]["name"] for tool in observation_tools] == ["dataset_info"]
     assert functions["dataset_info"]["parameters"] == {
         "type": "object",
@@ -572,7 +588,7 @@ def test_dataset_info_does_not_accept_columns(workflow):
 def test_model_cannot_request_unregistered_tool_with_valid_arguments(workflow):
     frame = real_load_csv(workflow.csv)
     with pytest.raises(ValueError, match="工具名称"):
-        workflow.module.execute_tool(frame, "correlation", "{}")
+        workflow.module.execute_tool(frame, "unknown_tool", "{}")
     workflow.execute.assert_not_called()
     workflow.describe.assert_not_called()
 
@@ -892,6 +908,277 @@ def test_group_failure_is_preserved_without_second_request(workflow, capsys):
         calls=[
             tool_call(
                 name="group_aggregate",
+                arguments=arguments,
+            )
+        ],
+        finish_reason="tool_calls",
+    )
+    with pytest.raises(RuntimeError) as caught:
+        workflow.module.main(workflow.csv)
+    assert caught.value is original
+    assert workflow.create.call_count == 1
+    assert "模型最终回答" not in capsys.readouterr().out
+
+
+def test_correlation_schema_requires_two_columns_and_pearson(workflow):
+    functions = {
+        tool["function"]["name"]: tool["function"] for tool in workflow.module.TOOLS
+    }
+    parameters = functions["correlation"]["parameters"]
+    fields = {"x_column", "y_column", "method"}
+    assert parameters["type"] == "object"
+    assert set(parameters["required"]) == fields
+    assert set(parameters["properties"]) == fields
+    assert parameters["additionalProperties"] is False
+    for field in fields:
+        assert parameters["properties"][field]["type"] == "string"
+    assert parameters["properties"]["method"]["enum"] == ["pearson"]
+
+
+def run_correlation_case(workflow, *, x_column="x", y_column="y"):
+    """Run real CSV/statistics with only the model replies replaced."""
+    arguments = json.dumps(
+        {"x_column": x_column, "y_column": y_column, "method": "pearson"}
+    )
+    workflow.pending[0] = response(
+        calls=[
+            tool_call(
+                name="correlation",
+                identifier="correlation_id",
+                arguments=arguments,
+            )
+        ],
+        finish_reason="tool_calls",
+    )
+    workflow.pending[1] = response(content="模拟相关性解释。")
+    question = "请计算这两个数值字段的 Pearson 相关系数并说明有效样本数"
+    before = real_load_csv(workflow.csv)
+    workflow.module.main(workflow.csv, question)
+    workflow.execute.assert_not_called()
+    workflow.describe.assert_not_called()
+    workflow.aggregate.assert_not_called()
+    workflow.correlate.assert_called_once()
+    frame = workflow.correlate.call_args.args[0]
+    pd.testing.assert_frame_equal(frame, before)
+    assert workflow.correlate.call_args.kwargs == {
+        "x_column": x_column,
+        "y_column": y_column,
+        "method": "pearson",
+    }
+    assert workflow.events == ["request", "execute", "request"]
+    first, second = workflow.requests
+    assert first["messages"][1] == {"role": "user", "content": question}
+    system = first["messages"][0]["content"]
+    assert json.loads(system[system.index("{") :]) == {
+        name: str(dtype) for name, dtype in before.dtypes.items()
+    }
+    assert second["messages"][:2] == first["messages"]
+    assistant, tool = second["messages"][2:]
+    assert assistant["tool_calls"] == [
+        {
+            "id": "correlation_id",
+            "type": "function",
+            "function": {"name": "correlation", "arguments": arguments},
+        }
+    ]
+    assert tool["role"] == "tool" and tool["tool_call_id"] == "correlation_id"
+    assert "tools" not in second and "response_format" not in second
+    result = json.loads(tool["content"])
+    assert set(result) == {
+        "x_column",
+        "y_column",
+        "method",
+        "coefficient",
+        "sample_size",
+        "status",
+    }
+    assert result["x_column"] == x_column and result["y_column"] == y_column
+    assert result["method"] == "pearson"
+    json.dumps(result, allow_nan=False)
+    return result
+
+
+@pytest.mark.parametrize(
+    "values,expected",
+    [
+        ("1,2\n2,4\n3,6\n", 1.0),
+        ("1,6\n2,4\n3,2\n", -1.0),
+        ("1,1\n2,0\n3,1\n", 0.0),
+    ],
+)
+def test_known_correlations_are_returned_including_genuine_zero(
+    workflow, values, expected
+):
+    workflow.csv.write_text("x,y\n" + values, encoding="utf-8")
+    result = run_correlation_case(workflow)
+    assert result["status"] == "ok"
+    assert result["sample_size"] == 3
+    assert result["coefficient"] == pytest.approx(expected)
+
+
+def test_correlation_counts_complete_pairs_not_individual_values(workflow):
+    workflow.csv.write_text(
+        "x,y,region\n1,2,A\n2,,B\n3,6,C\n,8,D\n5,10,E\n,,F\n", encoding="utf-8"
+    )
+    df = real_load_csv(workflow.csv)
+    assert int(df["x"].count()) == int(df["y"].count()) == 4
+    result = run_correlation_case(workflow)
+    assert result["sample_size"] == 3
+    assert result["coefficient"] == pytest.approx(1.0)
+    assert result["status"] == "ok"
+
+
+def test_same_numeric_column_is_allowed_by_existing_tool(workflow):
+    workflow.csv.write_text("x,y\n1,2\n2,4\n3,6\n", encoding="utf-8")
+    result = run_correlation_case(workflow, y_column="x")
+    assert result["status"] == "ok"
+    assert result["coefficient"] == pytest.approx(1.0)
+
+
+@pytest.mark.parametrize("values", ["1,2\n1,3\n1,4\n", "1,2\n2,2\n3,2\n"])
+def test_constant_column_returns_zero_variance_with_null(workflow, values):
+    workflow.csv.write_text("x,y\n" + values, encoding="utf-8")
+    result = run_correlation_case(workflow)
+    assert result["coefficient"] is None
+    assert result["sample_size"] == 3
+    assert result["status"] == "zero_variance"
+
+
+@pytest.mark.parametrize("values,n", [("1,2\n2,\n", 1), ("1,\n,2\n", 0)])
+def test_insufficient_complete_pairs_return_null_not_zero(workflow, values, n):
+    workflow.csv.write_text("x,y\n" + values, encoding="utf-8")
+    result = run_correlation_case(workflow)
+    assert result["coefficient"] is None
+    assert result["sample_size"] == n
+    assert result["status"] == "insufficient_samples"
+
+
+def test_sales_correlation_matches_independent_statistics_calculation(workflow):
+    workflow.csv = Path(__file__).resolve().parents[1] / "data/samples/sales.csv"
+    with workflow.csv.open(encoding="utf-8", newline="") as source:
+        pairs = [
+            (float(row["sales"]), float(row["advertising_spend"]))
+            for row in csv.DictReader(source)
+            if row["sales"] and row["advertising_spend"]
+        ]
+    assert len(pairs) == 36
+    expected = statistics.correlation(*zip(*pairs, strict=True))
+    result = run_correlation_case(
+        workflow, x_column="sales", y_column="advertising_spend"
+    )
+    assert result["sample_size"] == 36
+    assert result["status"] == "ok"
+    assert result["coefficient"] == pytest.approx(expected)
+    assert result["coefficient"] == pytest.approx(0.9409742630262548)
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        {},
+        {"x_column": "sales", "y_column": "sales"},
+        {"x_column": "sales", "method": "pearson"},
+        {"y_column": "sales", "method": "pearson"},
+        {"x_column": "sales", "y_column": "sales", "method": "pearson", "fillna": 0},
+    ],
+)
+def test_correlation_requires_exact_fields(workflow, arguments):
+    workflow.pending[0] = response(
+        calls=[
+            tool_call(
+                name="correlation",
+                arguments=json.dumps(arguments),
+            )
+        ],
+        finish_reason="tool_calls",
+    )
+    with pytest.raises(ValueError, match="三个必填参数"):
+        workflow.module.main(workflow.csv)
+    assert_no_execution_or_second_request(workflow)
+
+
+@pytest.mark.parametrize("field", ["x_column", "y_column", "method"])
+@pytest.mark.parametrize("value", [None, 1, True, []])
+def test_correlation_parameter_types_are_strict(workflow, field, value):
+    arguments = {"x_column": "sales", "y_column": "sales", "method": "pearson"}
+    arguments[field] = value
+    workflow.pending[0] = response(
+        calls=[
+            tool_call(
+                name="correlation",
+                arguments=json.dumps(arguments),
+            )
+        ],
+        finish_reason="tool_calls",
+    )
+    with pytest.raises(ValueError, match="必须是字符串"):
+        workflow.module.main(workflow.csv)
+    assert_no_execution_or_second_request(workflow)
+
+
+@pytest.mark.parametrize("method", ["spearman", "kendall", "Pearson", ""])
+def test_correlation_method_is_checked_locally_despite_enum(workflow, method):
+    arguments = {"x_column": "sales", "y_column": "sales", "method": method}
+    workflow.pending[0] = response(
+        calls=[
+            tool_call(
+                name="correlation",
+                arguments=json.dumps(arguments),
+            )
+        ],
+        finish_reason="tool_calls",
+    )
+    with pytest.raises(ValueError, match="Unsupported correlation method"):
+        workflow.module.main(workflow.csv)
+    workflow.correlate.assert_called_once()
+    assert workflow.create.call_count == 1
+
+
+@pytest.mark.parametrize("field", ["x_column", "y_column"])
+@pytest.mark.parametrize("column", ["absent", "region", " "])
+def test_both_correlation_columns_are_validated(workflow, field, column):
+    arguments = {"x_column": "sales", "y_column": "sales", "method": "pearson"}
+    arguments[field] = column
+    workflow.pending[0] = response(
+        calls=[
+            tool_call(
+                name="correlation",
+                arguments=json.dumps(arguments),
+            )
+        ],
+        finish_reason="tool_calls",
+    )
+    with pytest.raises(ValueError):
+        workflow.module.main(workflow.csv)
+    workflow.correlate.assert_called_once()
+    assert workflow.create.call_count == 1
+
+
+@pytest.mark.parametrize("arguments", ["not JSON", "[]", "null"])
+def test_correlation_arguments_must_be_json_object(workflow, arguments):
+    workflow.pending[0] = response(
+        calls=[
+            tool_call(
+                name="correlation",
+                arguments=arguments,
+            )
+        ],
+        finish_reason="tool_calls",
+    )
+    expected = json.JSONDecodeError if arguments == "not JSON" else ValueError
+    with pytest.raises(expected):
+        workflow.module.main(workflow.csv)
+    assert_no_execution_or_second_request(workflow)
+
+
+def test_correlation_failure_prevents_second_request(workflow, capsys):
+    original = RuntimeError("correlation calculation failed")
+    workflow.correlate.side_effect = original
+    arguments = '{"x_column":"sales","y_column":"sales","method":"pearson"}'
+    workflow.pending[0] = response(
+        calls=[
+            tool_call(
+                name="correlation",
                 arguments=arguments,
             )
         ],

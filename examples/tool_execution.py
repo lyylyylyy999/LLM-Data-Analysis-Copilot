@@ -4,6 +4,8 @@
     python -m examples.tool_execution --csv data/samples/sales.csv
     python -m examples.tool_execution --csv data/samples/sales.csv \
         --question "请描述 sales 的基本统计特征。"
+    python -m examples.tool_execution --csv data/samples/sales.csv \
+        --question "sales 与 advertising_spend 的 Pearson 相关系数是多少？"
 
 任务 08 的 examples/tool_calling.py 只负责观察工具请求，不修改它。
 """
@@ -20,6 +22,7 @@ from openai import OpenAI
 from openai.types.chat import ChatCompletionMessageParam, ChatCompletionToolParam
 
 from data_copilot.analysis_tools import (
+    correlation,
     dataset_info,
     describe_numeric,
     group_aggregate,
@@ -89,6 +92,38 @@ TOOLS: list[ChatCompletionToolParam] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "correlation",
+            "description": (
+                "计算两个数值字段之间的 Pearson 相关系数，仅使用两列同时非缺失"
+                "的样本对。无法计算时系数为 null，并以 status 说明原因。"
+                "相关关系不代表因果，工具不提供 p 值或置信区间。"
+                "数据集由 Python 管理，无需传入 DataFrame。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "x_column": {
+                        "type": "string",
+                        "description": "第一个数值列名，如 sales。",
+                    },
+                    "y_column": {
+                        "type": "string",
+                        "description": "第二个数值列名，如 advertising_spend。",
+                    },
+                    "method": {
+                        "type": "string",
+                        "enum": ["pearson"],
+                        "description": "相关系数的计算方法，目前仅支持 pearson。",
+                    },
+                },
+                "required": ["x_column", "y_column", "method"],
+                "additionalProperties": False,
+            },
+        },
+    },
 ]
 
 SYSTEM_PROMPT = (
@@ -106,6 +141,14 @@ SYSTEM_PROMPT = (
     "如未提供总行数，不要根据 count 推断缺失值的具体数量。"
     "group_aggregate 的 count 仅统计目标列的非缺失值，不是组内总行数；"
     "缺失分组键会以 null 保留，不能忽略；全缺失组的 sum 为 null，不能当作 0。"
+    "询问两个数值字段之间的 Pearson 相关性时使用 correlation，"
+    "提供 x_column、y_column、method=pearson。"
+    "相关工具的 sample_size 是两列同时非缺失的完整观测对数，"
+    "不等于任意单列的非缺失数量；不插补缺失值。"
+    "当 status 为 insufficient_samples、zero_variance 或其他无法计算状态时，"
+    "coefficient=null 代表相关系数无法计算，绝不代表相关系数等于零。"
+    "相关关系不等于因果关系，不能据此证明广告导致销售额提高。"
+    "该工具未返回 p 值或置信区间，不得声称已完成显著性检验。"
     "不将描述统计或分组差异解释为因果关系。"
 )
 
@@ -113,8 +156,13 @@ SYSTEM_PROMPT = (
 def execute_tool(
     dataframe: pd.DataFrame, tool_name: str, arguments_json: str
 ) -> dict[str, Any]:
-    """白名单分发三种工具；严格验证参数后交由真实统计函数执行。"""
-    if tool_name not in {"dataset_info", "describe_numeric", "group_aggregate"}:
+    """白名单分发四种工具；严格验证参数后交由真实统计函数执行。"""
+    if tool_name not in {
+        "dataset_info",
+        "describe_numeric",
+        "group_aggregate",
+        "correlation",
+    }:
         raise ValueError(f"不支持的工具名称：{tool_name}")
 
     # 无效 JSON 原样抛出 JSONDecodeError；数组、null 等非对象也应拒绝。
@@ -141,18 +189,34 @@ def execute_tool(
         # 复用统计函数对空白、重复、未知及非数值列的校验。
         return describe_numeric(dataframe, cast(list[str], columns))
 
-    required = {"group_column", "target_column", "aggregation"}
-    if set(arguments) != required:
-        raise ValueError("group_aggregate 必须且只能包含三个必填参数")
-    if any(not isinstance(arguments[name], str) for name in required):
-        raise ValueError("group_aggregate 的三个参数都必须是字符串")
+    if tool_name == "group_aggregate":
+        required = {"group_column", "target_column", "aggregation"}
+        if set(arguments) != required:
+            raise ValueError("group_aggregate 必须且只能包含三个必填参数")
+        if any(not isinstance(arguments[name], str) for name in required):
+            raise ValueError("group_aggregate 的三个参数都必须是字符串")
 
-    # 现有统计函数校验列是否存在、目标类型与聚合方法的允许值。
-    return group_aggregate(
+        # 现有统计函数校验列是否存在、目标类型与聚合方法的允许值。
+        return group_aggregate(
+            dataframe,
+            group_column=arguments["group_column"],
+            target_column=arguments["target_column"],
+            aggregation=arguments["aggregation"],
+        )
+
+    required = {"x_column", "y_column", "method"}
+    if set(arguments) != required:
+        raise ValueError("correlation 必须且只能包含三个必填参数")
+    if any(not isinstance(arguments[name], str) for name in required):
+        raise ValueError("correlation 的三个参数都必须是字符串")
+
+    # 底层函数检查列名、数值类型及 method == "pearson"。
+    # 仅允许明确的调用分支，不执行模型提供的任意函数名称。
+    return correlation(
         dataframe,
-        group_column=arguments["group_column"],
-        target_column=arguments["target_column"],
-        aggregation=arguments["aggregation"],
+        x_column=arguments["x_column"],
+        y_column=arguments["y_column"],
+        method=arguments["method"],
     )
 
 
