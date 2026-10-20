@@ -1,4 +1,4 @@
-"""Offline validation of tool execution batches and their two-request message chain."""
+"""Offline validation of tool batches and bounded model request histories."""
 
 import copy
 import csv
@@ -223,7 +223,7 @@ def test_service_direct_answer_returns_first_model_and_no_tools(
 @pytest.mark.parametrize("content", [None, "", " \n\t", 42])
 def test_service_rejects_invalid_direct_answer(workflow, content):
     workflow.pending[0] = response(content=content)
-    with pytest.raises(RuntimeError, match="第一轮.*正文"):
+    with pytest.raises(RuntimeError, match="第1次请求.*正文"):
         workflow.service.analyze_question(pd.DataFrame(), "问题")
     assert_no_execution_or_second_request(workflow)
 
@@ -304,6 +304,210 @@ def test_new_modules_import_without_config_client_or_output(
     assert capsys.readouterr() == ("", "")
 
 
+@pytest.mark.parametrize("limit", [True, False, 0, -1, None, 1.0, "2", [], {}])
+def test_invalid_round_limit_is_rejected_before_config(workflow, limit):
+    with pytest.raises(ValueError, match="max_tool_rounds.*正整数"):
+        workflow.service.analyze_question(pd.DataFrame(), "问题", max_tool_rounds=limit)
+    workflow.dotenv.assert_not_called()
+    workflow.constructor.assert_not_called()
+    workflow.create.assert_not_called()
+
+
+def test_dependent_tool_rounds_preserve_history_results_and_final_model(
+    workflow, capsys
+):
+    frame = pd.DataFrame({"sales": [10, None, 30], "quantity": [1, 2, 3]})
+    before = frame.copy(deep=True)
+    first_call = tool_call(identifier="info", arguments="{ }")
+    second_call = tool_call(
+        identifier="stats", name="describe_numeric", arguments='{"columns":["sales"]}'
+    )
+    workflow.pending[:] = [
+        response(calls=[first_call], content="先检查缺失", finish_reason="tool_calls"),
+        response(
+            calls=[second_call], content="再分析缺失列", finish_reason="tool_calls"
+        ),
+        response(content="模拟最终说明"),
+    ]
+    workflow.pending[-1].model = "third-response-model"
+    result = workflow.service.analyze_question(
+        frame, "先检查缺失，再分析", max_tool_rounds=2
+    )
+    assert workflow.events == ["request", "execute", "request", "execute", "request"]
+    expected = [real_dataset_info(before), real_describe_numeric(before, ["sales"])]
+    assert result == {
+        "answer": "模拟最终说明",
+        "model": "third-response-model",
+        "finish_reason": "stop",
+        "tool_results": [
+            {
+                "tool_call_id": call.id,
+                "name": call.function.name,
+                "arguments": json.loads(call.function.arguments),
+                "result": value,
+            }
+            for call, value in zip([first_call, second_call], expected, strict=True)
+        ],
+    }
+    for index, request in enumerate(workflow.requests):
+        assert request["tool_choice"] == "auto"
+        assert request["tools"] == workflow.registry.TOOLS
+        assert request["parallel_tool_calls"] is True
+        assert len(request["messages"]) == 2 + index * 2
+        if index:
+            previous = workflow.requests[index - 1]["messages"]
+            assert request["messages"][:-2] == previous
+            assistant, tool_message = request["messages"][-2:]
+            call = [first_call, second_call][index - 1]
+            assert assistant == {
+                "role": "assistant",
+                "content": ["先检查缺失", "再分析缺失列"][index - 1],
+                "tool_calls": [call.model_dump()],
+            }
+            assert tool_message == {
+                "role": "tool",
+                "tool_call_id": call.id,
+                "content": json.dumps(
+                    expected[index - 1], ensure_ascii=False, allow_nan=False
+                ),
+            }
+    pd.testing.assert_frame_equal(frame, before)
+    workflow.read.assert_not_called()
+    assert capsys.readouterr() == ("", "")
+    json.dumps(result, ensure_ascii=False, allow_nan=False)
+
+
+@pytest.mark.parametrize("limit", [1, 2, 3])
+@pytest.mark.parametrize("answer_at_limit", [True, False])
+def test_round_budget_counts_batches_not_calls(workflow, limit, answer_at_limit):
+    # Two calls in every batch: reaching the limit depends on batches, not call count.
+    workflow.pending[:] = [
+        response(
+            calls=[tool_call(identifier=f"r{r}_a"), tool_call(identifier=f"r{r}_b")],
+            finish_reason="tool_calls",
+        )
+        for r in range(limit)
+    ]
+    final = (
+        response(content="已完成")
+        if answer_at_limit
+        else response(
+            calls=[tool_call(identifier="over_budget")], finish_reason="tool_calls"
+        )
+    )
+    workflow.pending.append(final)
+    if answer_at_limit:
+        result = workflow.service.analyze_question(
+            pd.DataFrame({"x": [1]}), "问题", max_tool_rounds=limit
+        )
+        assert len(result["tool_results"]) == limit * 2
+        assert [item["tool_call_id"] for item in result["tool_results"]] == [
+            f"r{r}_{suffix}" for r in range(limit) for suffix in ("a", "b")
+        ]
+    else:
+        with pytest.raises(RuntimeError, match=f"轮数.*上限 {limit}"):
+            workflow.service.analyze_question(
+                pd.DataFrame({"x": [1]}), "问题", max_tool_rounds=limit
+            )
+    assert workflow.create.call_count == limit + 1
+    assert workflow.execute.call_count == limit * 2
+    assert len(workflow.requests[-1]["messages"]) == 2 + 3 * limit
+    assert workflow.pending == []
+
+
+def test_default_limit_stops_after_three_batches(workflow):
+    workflow.pending[:] = [
+        response(calls=[tool_call(identifier=f"r{i}")], finish_reason="tool_calls")
+        for i in range(4)
+    ]
+    with pytest.raises(RuntimeError, match="轮数.*上限 3"):
+        workflow.service.analyze_question(pd.DataFrame(), "问题")
+    assert workflow.execute.call_count == 3
+    assert workflow.create.call_count == 4
+
+
+@pytest.mark.parametrize("limit", [1, 5])
+def test_direct_answer_needs_only_one_request_regardless_of_budget(workflow, limit):
+    workflow.pending[:] = [response(content="无需工具的回答")]
+    result = workflow.service.analyze_question(
+        pd.DataFrame(), "问题", max_tool_rounds=limit
+    )
+    assert result["tool_results"] == []
+    assert_no_execution_or_second_request(workflow)
+
+
+@pytest.mark.parametrize(
+    "failure,pattern",
+    [
+        (SimpleNamespace(choices=[]), "choice"),
+        (response(content="截断正文", finish_reason="length"), "截断"),
+        (response(refusal="拒绝"), "拒绝"),
+        (response(content="受限", finish_reason="content_filter"), "状态异常"),
+        (response(calls=[], finish_reason="tool_calls"), "未返回工具调用"),
+        (response(calls=[tool_call()], finish_reason="stop"), "结束原因不是"),
+        (response(content=" \n"), "有效正文"),
+    ],
+)
+def test_third_response_validation_stops_without_more_execution(
+    workflow, failure, pattern
+):
+    workflow.pending[:] = [
+        response(calls=[tool_call(identifier=f"r{i}")], finish_reason="tool_calls")
+        for i in range(2)
+    ] + [failure]
+    with pytest.raises(RuntimeError, match=f"第3次请求.*{pattern}"):
+        workflow.service.analyze_question(pd.DataFrame(), "问题")
+    assert workflow.create.call_count == 3
+    assert workflow.execute.call_count == 2
+
+
+def test_later_api_error_preserves_original_exception_and_stops(workflow):
+    original = OpenAIError("third request failed")
+    workflow.pending[:] = [
+        response(calls=[tool_call(identifier=f"r{i}")], finish_reason="tool_calls")
+        for i in range(2)
+    ] + [original]
+    with pytest.raises(OpenAIError) as caught:
+        workflow.service.analyze_question(pd.DataFrame(), "问题")
+    assert caught.value is original
+    assert workflow.create.call_count == 3
+    assert workflow.execute.call_count == 2
+
+
+@pytest.mark.parametrize(
+    "failure", ["id", "type", "duplicate", "json", "calculation", "serialize"]
+)
+def test_later_tool_batch_failure_stops_without_next_request(workflow, failure):
+    second = [tool_call(identifier="second")]
+    original = ValueError("second batch failed")
+    if failure == "id":
+        second = [SimpleNamespace(type="function", id=" ")]
+    elif failure == "type":
+        second = [SimpleNamespace(type="custom")]
+    elif failure == "duplicate":
+        second *= 2
+    elif failure == "json":
+        second[0].function.arguments = "invalid JSON"
+    elif failure == "calculation":
+        workflow.execute.side_effect = [real_dataset_info(pd.DataFrame()), original]
+    elif failure == "serialize":
+        workflow.execute.side_effect = [
+            real_dataset_info(pd.DataFrame()),
+            {"x": float("inf")},
+        ]
+    workflow.pending[:] = [
+        response(calls=[tool_call()], finish_reason="tool_calls"),
+        response(calls=second, finish_reason="tool_calls"),
+    ]
+    with pytest.raises(ValueError) as caught:
+        workflow.service.analyze_question(pd.DataFrame(), "问题")
+    if failure == "calculation":
+        assert caught.value is original
+    assert workflow.create.call_count == 2
+    expected_executions = 2 if failure in {"calculation", "serialize"} else 1
+    assert workflow.execute.call_count == expected_executions
+
+
 def assert_no_execution_or_second_request(workflow):
     workflow.execute.assert_not_called()
     workflow.describe.assert_not_called()
@@ -315,7 +519,7 @@ def assert_no_execution_or_second_request(workflow):
 def assert_batch_message_chain(workflow, calls, expected_results):
     first, second = workflow.requests
     assert first["parallel_tool_calls"] is True
-    assert second["tool_choice"] == "none"
+    assert second["tool_choice"] == "auto"
     assert second["messages"][:2] == first["messages"]
     assistant, *results = second["messages"][2:]
     assert assistant == {
@@ -524,7 +728,7 @@ def test_complete_message_chain_uses_real_dataframe(workflow, capsys):
     assert first["messages"][1] == {"role": "user", "content": workflow.module.QUESTION}
     assert "East" not in system and "North" not in system
     assert second["tools"] == workflow.registry.TOOLS
-    assert second["tool_choice"] == "none"
+    assert second["tool_choice"] == "auto"
     assert "response_format" not in first and "response_format" not in second
     assert second["messages"][:2] == first["messages"]
     assert len(second["messages"]) == 4
@@ -572,7 +776,7 @@ def test_no_tool_request_stops_after_first_round(workflow, calls, capsys):
 
 def test_no_first_choices(workflow):
     workflow.pending[0] = SimpleNamespace(choices=[])
-    with pytest.raises(RuntimeError, match="第一轮.*choice"):
+    with pytest.raises(RuntimeError, match="第1次请求.*choice"):
         workflow.module.main(workflow.csv)
     assert_no_execution_or_second_request(workflow)
 
@@ -589,7 +793,7 @@ def test_first_refusal_prevents_execution(workflow):
     workflow.pending[0] = response(
         calls=[tool_call()], finish_reason="tool_calls", refusal="declined"
     )
-    with pytest.raises(RuntimeError, match="第一轮.*拒绝"):
+    with pytest.raises(RuntimeError, match="第1次请求.*拒绝"):
         workflow.module.main(workflow.csv)
     assert_no_execution_or_second_request(workflow)
 
@@ -719,17 +923,20 @@ def test_api_errors_are_preserved_without_extra_requests(
 
 def test_no_second_choices(workflow):
     workflow.pending[1] = SimpleNamespace(choices=[])
-    with pytest.raises(RuntimeError, match="第二轮.*choice"):
+    with pytest.raises(RuntimeError, match="第2次请求.*choice"):
         workflow.module.main(workflow.csv)
     assert workflow.create.call_count == 2
 
 
-@pytest.mark.parametrize("reason", ["length", None, "tool_calls"])
+@pytest.mark.parametrize(
+    "reason,detail",
+    [("length", "截断"), (None, "状态异常"), ("tool_calls", "未返回工具调用")],
+)
 def test_abnormal_second_finish_is_not_presented_as_final_answer(
-    workflow, reason, capsys
+    workflow, reason, detail, capsys
 ):
     workflow.pending[1] = response(content="partial", finish_reason=reason)
-    with pytest.raises(RuntimeError, match="第二轮.*未正常结束"):
+    with pytest.raises(RuntimeError, match=f"第2次请求.*{detail}"):
         workflow.module.main(workflow.csv)
     assert "模型最终回答" not in capsys.readouterr().out
     assert workflow.create.call_count == 2
@@ -737,7 +944,7 @@ def test_abnormal_second_finish_is_not_presented_as_final_answer(
 
 def test_second_refusal_is_rejected(workflow):
     workflow.pending[1] = response(content="ignored", refusal="declined")
-    with pytest.raises(RuntimeError, match="第二轮.*拒绝"):
+    with pytest.raises(RuntimeError, match="第2次请求.*拒绝"):
         workflow.module.main(workflow.csv)
 
 
@@ -745,7 +952,7 @@ def test_unexpected_second_tool_call_is_rejected(workflow):
     workflow.pending[1] = response(
         calls=[tool_call(identifier="unexpected")], content="ignored"
     )
-    with pytest.raises(RuntimeError, match="第二轮意外"):
+    with pytest.raises(RuntimeError, match="第2次请求意外"):
         workflow.module.main(workflow.csv)
     assert workflow.create.call_count == 2
     workflow.execute.assert_called_once()
@@ -858,7 +1065,7 @@ def test_descriptive_tool_end_to_end_uses_model_columns(workflow, columns, capsy
             "unavailable_statistics": [],
         }
     assert second["tools"] == workflow.registry.TOOLS
-    assert second["tool_choice"] == "none"
+    assert second["tool_choice"] == "auto"
     assert "response_format" not in second
     json.dumps(result, allow_nan=False)
     assert "模型最终回答：以下为模型的模拟解释。" in capsys.readouterr().out
@@ -1084,7 +1291,7 @@ def test_group_end_to_end_preserves_missing_keys_and_values(
     assert result["groups"][2]["value"] == (0 if aggregation == "count" else None)
     assert result["groups"][3]["value"] == (1 if aggregation == "count" else 0)
     assert second["tools"] == workflow.registry.TOOLS
-    assert second["tool_choice"] == "none"
+    assert second["tool_choice"] == "auto"
     assert "response_format" not in second
     json.dumps(result, allow_nan=False)
     assert "模型最终回答：模拟解释" in capsys.readouterr().out
@@ -1325,7 +1532,7 @@ def run_correlation_case(workflow, *, x_column="x", y_column="y"):
     ]
     assert tool["role"] == "tool" and tool["tool_call_id"] == "correlation_id"
     assert second["tools"] == workflow.registry.TOOLS
-    assert second["tool_choice"] == "none"
+    assert second["tool_choice"] == "auto"
     assert "response_format" not in second
     result = json.loads(tool["content"])
     assert set(result) == {

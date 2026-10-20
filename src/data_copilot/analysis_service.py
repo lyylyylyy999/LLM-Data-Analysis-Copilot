@@ -1,4 +1,4 @@
-"""封装单轮工具批量执行和两轮模型请求的分析服务。"""
+"""可复用的数据分析服务：有限轮工具调用、真实结果回传和最终回答。"""
 
 import json
 import os
@@ -17,7 +17,7 @@ if TYPE_CHECKING:
 
 SYSTEM_PROMPT = (
     "你是严谨的数据分析助手，请用中文回答。当前数据集由 Python 管理。"
-    "你只知道下方列名及数据类型，不知道数据值或统计结果。"
+    "初次请求仅提供列名及数据类型，之后可根据工具结果继续分析。"
     "询问行数或列数时使用 dataset_info；询问数值列的描述统计时"
     "使用 describe_numeric，并将指定列名放进 columns 数组。"
     "询问按地区、商品类别等分组的聚合结果时使用 group_aggregate，"
@@ -39,9 +39,10 @@ SYSTEM_PROMPT = (
     "相关关系不等于因果关系，不能据此证明广告导致销售额提高。"
     "该工具未返回 p 值或置信区间，不得声称已完成显著性检验。"
     "不将描述统计或分组差异解释为因果关系。"
-    "复合问题必须在第一轮一次性请求全部必要工具；"
-    "同一工具也可按不同参数多次请求，不要留待后续轮次再请求。"
-    "收到工具执行结果后，直接根据已有结果回答，不要再次请求工具。"
+    "根据当前已知信息请求完成问题所需的工具：可以同轮请求多个工具，"
+    "也可以在收到工具结果后，再请求其他工具完成依赖性分析。"
+    "例如可先使用 dataset_info 识别缺失列，再使用 describe_numeric 统计它们。"
+    "已有足够真实结果时直接用中文回答，不要重复请求已经完成的计算。"
 )
 
 
@@ -73,14 +74,27 @@ def _result_payload(
     return result
 
 
-def analyze_question(dataframe: pd.DataFrame, question: str) -> dict[str, Any]:
-    """分析现成 DataFrame，最多请求模型两次，同轮工具依次执行。"""
+def analyze_question(
+    dataframe: pd.DataFrame,
+    question: str,
+    *,
+    max_tool_rounds: int = 3,
+) -> dict[str, Any]:
+    """分析现有 DataFrame，最多执行 max_tool_rounds 批工具并生成最终回答。
+
+    一批可包含多次工具调用；每批执行完后再次向模型请求下一步。
+    已用满工具轮数时仍允许一次模型请求产生最终文本，但不再执行工具。
+    """
+    if isinstance(max_tool_rounds, bool) or not isinstance(max_tool_rounds, int):
+        raise ValueError("max_tool_rounds 必须是正整数")
+    if max_tool_rounds <= 0:
+        raise ValueError("max_tool_rounds 必须是正整数")
     if not isinstance(question, str) or not question.strip():
         raise ValueError("问题不能为空")
     if not isinstance(dataframe, pd.DataFrame):
         raise TypeError("dataframe 必须是 pandas DataFrame")
 
-    # 模块导入时没有环境或网络副作用；每次调用时才读取配置、创建客户端。
+    # 导入模块不读取配置或创建客户端；只在函数调用时读取。
     load_dotenv()
     api_key = (os.getenv("DASHSCOPE_API_KEY") or "").strip()
     base_url = (os.getenv("DASHSCOPE_BASE_URL") or "").strip()
@@ -106,98 +120,106 @@ def analyze_question(dataframe: pd.DataFrame, question: str) -> dict[str, Any]:
         {"role": "user", "content": question},
     ]
     client = OpenAI(api_key=api_key, base_url=base_url, timeout=60.0)
-    first_response = client.chat.completions.create(
-        model=model,
-        messages=messages.copy(),
-        tools=TOOLS,
-        tool_choice="auto",
-        parallel_tool_calls=True,
-        extra_body={"enable_thinking": False},
-        stream=False,
-    )
-    if not first_response.choices:
-        raise RuntimeError("第一轮模型未返回任何 choice")
-
-    first_choice = first_response.choices[0]
-    first_message = first_choice.message
-    if first_choice.finish_reason == "length":
-        raise RuntimeError("第一轮模型响应被截断")
-    if first_message.refusal:
-        raise RuntimeError(f"第一轮模型拒绝回答：{first_message.refusal}")
-    if first_choice.finish_reason not in {"stop", "tool_calls"}:
-        raise RuntimeError(f"第一轮模型状态异常：{first_choice.finish_reason}")
-
-    tool_calls = first_message.tool_calls
-    if not tool_calls:
-        if first_choice.finish_reason != "stop":
-            raise RuntimeError("第一轮标记为 tool_calls，但未返回工具调用")
-        answer = _validate_final_answer(first_choice, "第一轮")
-        return _result_payload(answer, first_response.model, [])
-
-    if first_choice.finish_reason != "tool_calls":
-        raise RuntimeError("第一轮返回了工具调用，但结束原因不是 tool_calls")
-
-    # 执行任何工具之前，先校验整批请求的类型、ID 和重复 ID。
-    seen_ids: set[str] = set()
-    function_calls: list[ChatCompletionMessageFunctionToolCall] = []
-    for tool_call in tool_calls:
-        if tool_call.type != "function":
-            raise ValueError(f"不支持的工具调用类型：{tool_call.type}")
-        if not isinstance(tool_call.id, str) or not tool_call.id.strip():
-            raise ValueError("工具调用 ID 必须是非空字符串")
-        if tool_call.id in seen_ids:
-            raise ValueError(f"工具调用 ID 重复：{tool_call.id}")
-        seen_ids.add(tool_call.id)
-        function_calls.append(cast("ChatCompletionMessageFunctionToolCall", tool_call))
-
-    assistant_message: ChatCompletionMessageParam = {
-        "role": "assistant",
-        "content": first_message.content,
-        "tool_calls": [
-            {
-                "id": call.id,
-                "type": "function",
-                "function": {
-                    "name": call.function.name,
-                    "arguments": call.function.arguments,
-                },
-            }
-            for call in function_calls
-        ],
-    }
-
-    tool_messages: list[ChatCompletionMessageParam] = []
     tool_results: list[dict[str, Any]] = []
-    for call in function_calls:
-        # 原始参数与异常保留：不使用 eval/exec，也不从模型名称动态查找函数。
-        tool_result = execute_tool(
-            dataframe, call.function.name, call.function.arguments
-        )
-        result_json = json.dumps(tool_result, ensure_ascii=False, allow_nan=False)
-        tool_messages.append(
-            {"role": "tool", "tool_call_id": call.id, "content": result_json}
-        )
-        tool_results.append(
-            {
-                "tool_call_id": call.id,
-                "name": call.function.name,
-                "arguments": json.loads(call.function.arguments),
-                "result": tool_result,
-            }
-        )
+    completed_rounds = 0
 
-    # 只在全部工具成功后发送第二次请求；同一工具可按不同参数多次调用。
-    messages.append(assistant_message)
-    messages.extend(tool_messages)
-    second_response = client.chat.completions.create(
-        model=model,
-        messages=messages,
-        tools=TOOLS,
-        tool_choice="none",
-        extra_body={"enable_thinking": False},
-        stream=False,
-    )
-    if not second_response.choices:
-        raise RuntimeError("第二轮模型未返回任何 choice")
-    answer = _validate_final_answer(second_response.choices[0], "第二轮")
-    return _result_payload(answer, second_response.model, tool_results)
+    # 最多 max_tool_rounds 批执行 + 最后一次仅用于回答或检测超限的模型请求。
+    for _ in range(max_tool_rounds + 1):
+        response = client.chat.completions.create(
+            model=model,
+            messages=messages.copy(),
+            tools=TOOLS,
+            tool_choice="auto",
+            parallel_tool_calls=True,
+            extra_body={"enable_thinking": False},
+            stream=False,
+        )
+        round_name = f"第{completed_rounds + 1}次请求"
+        if not response.choices:
+            raise RuntimeError(f"{round_name}模型未返回任何 choice")
+
+        choice = response.choices[0]
+        message = choice.message
+        if choice.finish_reason == "length":
+            raise RuntimeError(f"{round_name}模型响应被截断")
+        if message.refusal:
+            raise RuntimeError(f"{round_name}模型拒绝回答：{message.refusal}")
+        if choice.finish_reason not in {"stop", "tool_calls"}:
+            raise RuntimeError(f"{round_name}模型状态异常：{choice.finish_reason}")
+
+        tool_calls = message.tool_calls
+        if not tool_calls:
+            if choice.finish_reason != "stop":
+                raise RuntimeError(f"{round_name}标记为 tool_calls，但未返回工具调用")
+            answer = _validate_final_answer(choice, round_name)
+            return _result_payload(answer, response.model, tool_results)
+
+        if choice.finish_reason != "tool_calls":
+            raise RuntimeError(
+                f"{round_name}意外返回了工具调用（结束原因不是 tool_calls）"
+            )
+        if completed_rounds >= max_tool_rounds:
+            raise RuntimeError(
+                f"工具调用轮数超过上限 {max_tool_rounds}；"
+                "模型继续请求工具，超限批次未执行"
+            )
+
+        # 执行本批任一工具之前，统一检查调用类型、ID 非空和批内 ID 唯一。
+        seen_ids: set[str] = set()
+        function_calls: list[ChatCompletionMessageFunctionToolCall] = []
+        for tool_call in tool_calls:
+            if tool_call.type != "function":
+                raise ValueError(f"不支持的工具调用类型：{tool_call.type}")
+            if not isinstance(tool_call.id, str) or not tool_call.id.strip():
+                raise ValueError("工具调用 ID 必须是非空字符串")
+            if tool_call.id in seen_ids:
+                raise ValueError(f"工具调用 ID 重复：{tool_call.id}")
+            seen_ids.add(tool_call.id)
+            function_calls.append(
+                cast("ChatCompletionMessageFunctionToolCall", tool_call)
+            )
+
+        assistant_message: ChatCompletionMessageParam = {
+            "role": "assistant",
+            "content": message.content,
+            "tool_calls": [
+                {
+                    "id": call.id,
+                    "type": "function",
+                    "function": {
+                        "name": call.function.name,
+                        "arguments": call.function.arguments,
+                    },
+                }
+                for call in function_calls
+            ],
+        }
+
+        tool_messages: list[ChatCompletionMessageParam] = []
+        batch_results: list[dict[str, Any]] = []
+        for call in function_calls:
+            # 不通过动态函数查找执行工具；底层校验与异常保持原样。
+            tool_result = execute_tool(
+                dataframe, call.function.name, call.function.arguments
+            )
+            result_json = json.dumps(tool_result, ensure_ascii=False, allow_nan=False)
+            tool_messages.append(
+                {"role": "tool", "tool_call_id": call.id, "content": result_json}
+            )
+            batch_results.append(
+                {
+                    "tool_call_id": call.id,
+                    "name": call.function.name,
+                    "arguments": json.loads(call.function.arguments),
+                    "result": tool_result,
+                }
+            )
+
+        # 执行成功后才追加完整 assistant 和所有 tool 消息；下一轮携带全部历史。
+        messages.append(assistant_message)
+        messages.extend(tool_messages)
+        tool_results.extend(batch_results)
+        completed_rounds += 1
+
+    # for 循环本身有限；正常完成必须在循环中以 stop 返回。
+    raise RuntimeError("工具调用轮数已达上限，模型未返回最终回答")
