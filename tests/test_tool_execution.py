@@ -104,6 +104,17 @@ def workflow(monkeypatch, tmp_path):
         )
     )
     monkeypatch.setattr("openai.OpenAI", constructor)
+    from data_copilot import tool_registry as registry
+
+    service_path = (
+        Path(__file__).resolve().parents[1] / "src/data_copilot/analysis_service.py"
+    )
+    service_spec = importlib.util.spec_from_file_location(
+        "analysis_service_test", service_path
+    )
+    assert service_spec is not None and service_spec.loader is not None
+    service = importlib.util.module_from_spec(service_spec)
+    service_spec.loader.exec_module(service)
     path = Path(__file__).resolve().parents[1] / "examples/tool_execution.py"
     spec = importlib.util.spec_from_file_location("tool_execution_example", path)
     assert spec is not None and spec.loader is not None
@@ -111,14 +122,17 @@ def workflow(monkeypatch, tmp_path):
     spec.loader.exec_module(module)
     read = Mock(wraps=real_load_csv)
     monkeypatch.setattr(module, "load_csv", read)
-    monkeypatch.setattr(module, "dataset_info", execute_mock)
-    monkeypatch.setattr(module, "describe_numeric", describe_mock)
-    monkeypatch.setattr(module, "group_aggregate", aggregate_mock)
-    monkeypatch.setattr(module, "correlation", correlate_mock)
+    monkeypatch.setattr(module, "analyze_question", service.analyze_question)
+    monkeypatch.setattr(registry, "dataset_info", execute_mock)
+    monkeypatch.setattr(registry, "describe_numeric", describe_mock)
+    monkeypatch.setattr(registry, "group_aggregate", aggregate_mock)
+    monkeypatch.setattr(registry, "correlation", correlate_mock)
     csv_path = tmp_path / "tiny.csv"
     csv_path.write_text("region,sales\nEast,10\nWest,\nNorth,30\n", encoding="utf-8")
     return SimpleNamespace(
         module=module,
+        service=service,
+        registry=registry,
         create=create,
         constructor=constructor,
         execute=execute_mock,
@@ -132,6 +146,162 @@ def workflow(monkeypatch, tmp_path):
         dotenv=dotenv,
         csv=csv_path,
     )
+
+
+def test_service_returns_complete_payload_without_printing(workflow, capsys):
+    frame = pd.DataFrame({"sales": [10, None, 30]})
+    before = frame.copy(deep=True)
+    workflow.pending[1].model = "actual-final-model"
+    result = workflow.service.analyze_question(frame, "多少行？")
+    assert result == {
+        "answer": "数据有3行、2列。",  # Mocked text is not a model accuracy assertion.
+        "model": "actual-final-model",
+        "finish_reason": "stop",
+        "tool_results": [
+            {
+                "tool_call_id": "call_1",
+                "name": "dataset_info",
+                "arguments": {},
+                "result": real_dataset_info(before),
+            }
+        ],
+    }
+    assert workflow.execute.call_args.args[0] is frame
+    workflow.read.assert_not_called()
+    pd.testing.assert_frame_equal(frame, before)
+    assert capsys.readouterr() == ("", "")
+    json.dumps(result, ensure_ascii=False, allow_nan=False)
+
+
+def test_service_returns_all_batch_results_in_order(workflow, capsys):
+    frame = pd.DataFrame({"sales": [10, 20, 30]})
+    calls = [
+        tool_call(identifier="a", arguments="{ }"),
+        tool_call(
+            identifier="b", name="describe_numeric", arguments='{"columns":["sales"]}'
+        ),
+    ]
+    workflow.pending[0] = response(calls=calls, finish_reason="tool_calls")
+    result = workflow.service.analyze_question(frame, "规模和销售统计？")
+    expected = [real_dataset_info(frame), real_describe_numeric(frame, ["sales"])]
+    assert result["tool_results"] == [
+        {
+            "tool_call_id": call.id,
+            "name": call.function.name,
+            "arguments": json.loads(call.function.arguments),
+            "result": value,
+        }
+        for call, value in zip(calls, expected, strict=True)
+    ]
+    for item, message in zip(
+        result["tool_results"], workflow.requests[1]["messages"][3:], strict=True
+    ):
+        assert item["tool_call_id"] == message["tool_call_id"]
+        assert item["result"] == json.loads(message["content"])
+    assert capsys.readouterr() == ("", "")
+    json.dumps(result, allow_nan=False)
+
+
+@pytest.mark.parametrize("calls", [None, []])
+def test_service_direct_answer_returns_first_model_and_no_tools(
+    workflow, calls, capsys
+):
+    workflow.pending[0] = response(calls=calls, content=" 相关不代表因果。 ")
+    workflow.pending[0].model = "actual-first-model"
+    result = workflow.service.analyze_question(pd.DataFrame(), "相关代表因果吗？")
+    assert result == {
+        "answer": " 相关不代表因果。 ",
+        "model": "actual-first-model",
+        "finish_reason": "stop",
+        "tool_results": [],
+    }
+    assert_no_execution_or_second_request(workflow)
+    assert capsys.readouterr() == ("", "")
+    json.dumps(result, allow_nan=False)
+
+
+@pytest.mark.parametrize("content", [None, "", " \n\t", 42])
+def test_service_rejects_invalid_direct_answer(workflow, content):
+    workflow.pending[0] = response(content=content)
+    with pytest.raises(RuntimeError, match="第一轮.*正文"):
+        workflow.service.analyze_question(pd.DataFrame(), "问题")
+    assert_no_execution_or_second_request(workflow)
+
+
+@pytest.mark.parametrize("question", [None, 1, "", " \n\t"])
+def test_service_rejects_invalid_question_before_config_or_client(workflow, question):
+    with pytest.raises(ValueError):
+        workflow.service.analyze_question(pd.DataFrame(), question)
+    workflow.dotenv.assert_not_called()
+    workflow.constructor.assert_not_called()
+
+
+@pytest.mark.parametrize("frame", [None, {}, [], "data.csv"])
+def test_service_rejects_non_dataframe_before_config_or_client(workflow, frame):
+    with pytest.raises(TypeError, match="DataFrame"):
+        workflow.service.analyze_question(frame, "问题")
+    workflow.dotenv.assert_not_called()
+    workflow.constructor.assert_not_called()
+
+
+def test_service_config_is_read_per_call_and_calls_do_not_share_history(
+    workflow, monkeypatch
+):
+    workflow.pending[:] = [response(content="回答一"), response(content="回答二")]
+    frame = pd.DataFrame({"sales": [1]})
+    workflow.service.analyze_question(frame, "问题一")
+    monkeypatch.setenv("DASHSCOPE_MODEL", "new-configured-model")
+    workflow.service.analyze_question(frame, "问题二")
+    assert workflow.dotenv.call_count == workflow.constructor.call_count == 2
+    assert [request["model"] for request in workflow.requests] == [
+        "configured-model",
+        "new-configured-model",
+    ]
+    for request, question in zip(workflow.requests, ["问题一", "问题二"], strict=True):
+        assert len(request["messages"]) == 2
+        assert request["messages"][1] == {"role": "user", "content": question}
+
+
+def test_cli_only_loads_delegates_and_displays(workflow, monkeypatch, capsys):
+    payload = {
+        "answer": "示例回答",
+        "model": "final-model",
+        "finish_reason": "stop",
+        "tool_results": [],
+    }
+    analyze = Mock(return_value=payload)
+    monkeypatch.setattr(workflow.module, "analyze_question", analyze)
+    result = workflow.module.main(workflow.csv, "一个问题")
+    assert result is payload
+    workflow.read.assert_called_once_with(workflow.csv)
+    analyze.assert_called_once()
+    pd.testing.assert_frame_equal(
+        analyze.call_args.args[0], real_load_csv(workflow.csv)
+    )
+    assert analyze.call_args.args[1] == "一个问题"
+    assert "模型最终回答：示例回答" in capsys.readouterr().out
+    workflow.constructor.assert_not_called()
+
+
+def test_new_modules_import_without_config_client_or_output(
+    workflow, monkeypatch, capsys
+):
+    forbidden = Mock(
+        side_effect=AssertionError("Import must not read config or create client")
+    )
+    monkeypatch.setattr("os.getenv", forbidden)
+    monkeypatch.setattr("dotenv.load_dotenv", forbidden)
+    monkeypatch.setattr("openai.OpenAI", forbidden)
+    root = Path(__file__).resolve().parents[1] / "src/data_copilot"
+    for name in ("tool_registry", "analysis_service"):
+        spec = importlib.util.spec_from_file_location(
+            f"import_check_{name}", root / f"{name}.py"
+        )
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+    forbidden.assert_not_called()
+    assert capsys.readouterr() == ("", "")
 
 
 def assert_no_execution_or_second_request(workflow):
@@ -285,7 +455,7 @@ def test_batch_failure_stops_remaining_execution_and_second_request(
         expected_error = ValueError
         original = ValueError("batch calculation failed")
     workflow.pending[0] = response(calls=calls, finish_reason="tool_calls")
-    actual_execute = workflow.module.execute_tool
+    actual_execute = workflow.service.execute_tool
     attempted = []
 
     def tracking_execute(dataframe, name, arguments):
@@ -298,7 +468,7 @@ def test_batch_failure_stops_remaining_execution_and_second_request(
             return {"invalid": float("nan")}
         return result
 
-    monkeypatch.setattr(workflow.module, "execute_tool", tracking_execute)
+    monkeypatch.setattr(workflow.service, "execute_tool", tracking_execute)
     with pytest.raises(expected_error) as caught:
         workflow.module.main(workflow.csv)
     if failure_kind == "calculation":
@@ -344,16 +514,16 @@ def test_complete_message_chain_uses_real_dataframe(workflow, capsys):
     assert first["model"] == second["model"] == "configured-model"
     assert first["stream"] is second["stream"] is False
     assert first["tool_choice"] == "auto"
-    assert first["tools"] == workflow.module.TOOLS
+    assert first["tools"] == workflow.registry.TOOLS
     assert len(first["messages"]) == 2
     assert first["messages"][0]["role"] == "system"
     system = first["messages"][0]["content"]
-    assert system.startswith(workflow.module.SYSTEM_PROMPT)
+    assert system.startswith(workflow.service.SYSTEM_PROMPT)
     metadata = json.loads(system[system.index("{") :])
     assert metadata == {name: str(dtype) for name, dtype in dataframe.dtypes.items()}
     assert first["messages"][1] == {"role": "user", "content": workflow.module.QUESTION}
     assert "East" not in system and "North" not in system
-    assert second["tools"] == workflow.module.TOOLS
+    assert second["tools"] == workflow.registry.TOOLS
     assert second["tool_choice"] == "none"
     assert "response_format" not in first and "response_format" not in second
     assert second["messages"][:2] == first["messages"]
@@ -592,7 +762,7 @@ def test_four_tool_schemas_do_not_change_task08_tool_definitions(workflow):
     from examples.tool_calling import TOOLS as observation_tools
 
     functions = {
-        tool["function"]["name"]: tool["function"] for tool in workflow.module.TOOLS
+        tool["function"]["name"]: tool["function"] for tool in workflow.registry.TOOLS
     }
     assert set(functions) == {
         "dataset_info",
@@ -616,7 +786,7 @@ def test_four_tool_schemas_do_not_change_task08_tool_definitions(workflow):
     assert columns["type"] == "array"
     assert columns["items"]["type"] == "string"
     assert columns["minItems"] == 1
-    json.dumps(workflow.module.TOOLS, allow_nan=False)
+    json.dumps(workflow.registry.TOOLS, allow_nan=False)
 
 
 @pytest.mark.parametrize("columns", [["sales"], ["sales", "advertising_spend"]])
@@ -687,7 +857,7 @@ def test_descriptive_tool_end_to_end_uses_model_columns(workflow, columns, capsy
             "max": 5.0,
             "unavailable_statistics": [],
         }
-    assert second["tools"] == workflow.module.TOOLS
+    assert second["tools"] == workflow.registry.TOOLS
     assert second["tool_choice"] == "none"
     assert "response_format" not in second
     json.dumps(result, allow_nan=False)
@@ -750,7 +920,7 @@ def test_describe_requires_json_object(workflow, arguments):
 def test_dataset_info_does_not_accept_columns(workflow):
     frame = real_load_csv(workflow.csv)
     with pytest.raises(ValueError, match="不接受参数"):
-        workflow.module.execute_tool(frame, "dataset_info", '{"columns":["sales"]}')
+        workflow.service.execute_tool(frame, "dataset_info", '{"columns":["sales"]}')
     workflow.execute.assert_not_called()
     workflow.describe.assert_not_called()
 
@@ -758,7 +928,7 @@ def test_dataset_info_does_not_accept_columns(workflow):
 def test_model_cannot_request_unregistered_tool_with_valid_arguments(workflow):
     frame = real_load_csv(workflow.csv)
     with pytest.raises(ValueError, match="工具名称"):
-        workflow.module.execute_tool(frame, "unknown_tool", "{}")
+        workflow.service.execute_tool(frame, "unknown_tool", "{}")
     workflow.execute.assert_not_called()
     workflow.describe.assert_not_called()
 
@@ -807,13 +977,13 @@ def test_python_function_accepts_string_but_tool_contract_requires_list(workflow
     frame = real_load_csv(workflow.csv)
     assert real_describe_numeric(frame, "sales")["statistics"]["sales"]["mean"] == 20.0
     with pytest.raises(ValueError, match="字符串数组"):
-        workflow.module.execute_tool(frame, "describe_numeric", '{"columns":"sales"}')
+        workflow.service.execute_tool(frame, "describe_numeric", '{"columns":"sales"}')
     workflow.describe.assert_not_called()
 
 
 def test_group_schema_has_exact_required_arguments_and_enum(workflow):
     tools = {
-        tool["function"]["name"]: tool["function"] for tool in workflow.module.TOOLS
+        tool["function"]["name"]: tool["function"] for tool in workflow.registry.TOOLS
     }
     parameters = tools["group_aggregate"]["parameters"]
     names = {"group_column", "target_column", "aggregation"}
@@ -913,7 +1083,7 @@ def test_group_end_to_end_preserves_missing_keys_and_values(
     # B has one missing target; C has a genuine zero. These must stay distinct.
     assert result["groups"][2]["value"] == (0 if aggregation == "count" else None)
     assert result["groups"][3]["value"] == (1 if aggregation == "count" else 0)
-    assert second["tools"] == workflow.module.TOOLS
+    assert second["tools"] == workflow.registry.TOOLS
     assert second["tool_choice"] == "none"
     assert "response_format" not in second
     json.dumps(result, allow_nan=False)
@@ -1094,7 +1264,7 @@ def test_group_failure_is_preserved_without_second_request(workflow, capsys):
 
 def test_correlation_schema_requires_two_columns_and_pearson(workflow):
     functions = {
-        tool["function"]["name"]: tool["function"] for tool in workflow.module.TOOLS
+        tool["function"]["name"]: tool["function"] for tool in workflow.registry.TOOLS
     }
     parameters = functions["correlation"]["parameters"]
     fields = {"x_column", "y_column", "method"}
@@ -1154,7 +1324,7 @@ def run_correlation_case(workflow, *, x_column="x", y_column="y"):
         }
     ]
     assert tool["role"] == "tool" and tool["tool_call_id"] == "correlation_id"
-    assert second["tools"] == workflow.module.TOOLS
+    assert second["tools"] == workflow.registry.TOOLS
     assert second["tool_choice"] == "none"
     assert "response_format" not in second
     result = json.loads(tool["content"])
