@@ -11,6 +11,7 @@ from unittest.mock import Mock
 import httpx
 import pandas as pd
 import pytest
+from fastapi.exceptions import ResponseValidationError
 from fastapi.testclient import TestClient
 
 from data_copilot.data_loader import load_csv as real_load_csv
@@ -191,3 +192,147 @@ def test_docs_are_available_without_analysis(api):
     assert "/health" in schema["paths"] and "/analyze" in schema["paths"]
     api.load.assert_not_called()
     api.service.assert_not_called()
+
+
+def test_openapi_exposes_request_response_and_nested_tool_models(api):
+    schema = api.client.get("/openapi.json").json()
+    operation = schema["paths"]["/analyze"]["post"]
+    assert operation["requestBody"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/AnalyzeRequest"
+    }
+    assert operation["responses"]["200"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/AnalyzeResponse"
+    }
+    models = schema["components"]["schemas"]
+    fields = {
+        "AnalyzeRequest": {"question"},
+        "AnalyzeResponse": {"answer", "model", "finish_reason", "tool_results"},
+        "ToolExecutionResult": {"tool_call_id", "name", "arguments", "result"},
+    }
+    for name, expected in fields.items():
+        assert set(models[name]["properties"]) == expected
+        assert set(models[name]["required"]) == expected
+        assert models[name]["additionalProperties"] is False
+    assert models["AnalyzeResponse"]["properties"]["tool_results"] == {
+        "type": "array",
+        "items": {"$ref": "#/components/schemas/ToolExecutionResult"},
+        "title": "Tool Results",
+    }
+    api.load.assert_not_called()
+    api.service.assert_not_called()
+
+
+def assert_invalid_service_response(api, location):
+    # TestClient normally re-raises server errors, which distinguishes these
+    # from RequestValidationError (422). Also verify the actual HTTP boundary.
+    with pytest.raises(ResponseValidationError) as caught:
+        api.client.post("/analyze", json={"question": "一个有效问题"})
+    assert any(tuple(error["loc"]) == location for error in caught.value.errors())
+    api.service.assert_called_once()
+    with TestClient(api.module.app, raise_server_exceptions=False) as client:
+        response = client.post("/analyze", json={"question": "一个有效问题"})
+    assert response.status_code == 500
+    assert response.text == "Internal Server Error"
+
+
+@pytest.mark.parametrize("field", ["answer", "model", "finish_reason", "tool_results"])
+def test_missing_top_level_response_field_is_server_error(api, field):
+    del api.service.return_value[field]
+    assert_invalid_service_response(api, ("response", field))
+
+
+@pytest.mark.parametrize("field", ["tool_call_id", "name", "arguments", "result"])
+def test_missing_nested_response_field_is_server_error(api, field):
+    del api.service.return_value["tool_results"][0][field]
+    assert_invalid_service_response(api, ("response", "tool_results", 0, field))
+
+
+@pytest.mark.parametrize("field", ["answer", "model"])
+@pytest.mark.parametrize("value", [None, 42, True, [], {}, "", " \t\n"])
+def test_invalid_response_text_is_server_error(api, field, value):
+    api.service.return_value[field] = value
+    assert_invalid_service_response(api, ("response", field))
+
+
+@pytest.mark.parametrize("field", ["tool_call_id", "name"])
+@pytest.mark.parametrize("value", [None, 42, True, [], {}, "", " \t\n"])
+def test_invalid_tool_identity_is_server_error(api, field, value):
+    api.service.return_value["tool_results"][0][field] = value
+    assert_invalid_service_response(api, ("response", "tool_results", 0, field))
+
+
+@pytest.mark.parametrize("value", [None, 42, "length", "tool_calls", "STOP", ""])
+def test_finish_reason_must_be_stop(api, value):
+    api.service.return_value["finish_reason"] = value
+    assert_invalid_service_response(api, ("response", "finish_reason"))
+
+
+@pytest.mark.parametrize("value", [None, {}, "tool", 42])
+def test_tool_results_must_be_list(api, value):
+    api.service.return_value["tool_results"] = value
+    assert_invalid_service_response(api, ("response", "tool_results"))
+
+
+@pytest.mark.parametrize("value", [None, "tool", 42, []])
+def test_tool_results_items_must_be_objects(api, value):
+    api.service.return_value["tool_results"] = [value]
+    assert_invalid_service_response(api, ("response", "tool_results", 0))
+
+
+@pytest.mark.parametrize("field", ["arguments", "result"])
+@pytest.mark.parametrize("value", [None, "{}", 42, [], [["x", 1]]])
+def test_tool_parameters_and_results_are_strict_dictionaries(api, field, value):
+    api.service.return_value["tool_results"][0][field] = value
+    assert_invalid_service_response(api, ("response", "tool_results", 0, field))
+
+
+@pytest.mark.parametrize("nested", [False, True])
+def test_response_extra_fields_are_rejected_instead_of_silently_dropped(api, nested):
+    if nested:
+        api.service.return_value["tool_results"][0]["unexpected"] = "extra"
+        location = ("response", "tool_results", 0, "unexpected")
+    else:
+        api.service.return_value["unexpected"] = "extra"
+        location = ("response", "unexpected")
+    assert_invalid_service_response(api, location)
+
+
+def test_response_allows_no_tool_calls_and_preserves_text(api):
+    payload = {
+        "answer": " 相关不代表因果。 ",
+        "model": " actual-model ",
+        "finish_reason": "stop",
+        "tool_results": [],
+    }
+    api.service.return_value = payload
+    response = api.client.post("/analyze", json={"question": "相关代表因果吗？"})
+    assert response.status_code == 200
+    assert response.json() == payload
+
+
+def test_response_preserves_multiple_generic_statistic_results(api):
+    payload = copy.deepcopy(api.payload)
+    payload["tool_results"].append(
+        {
+            "tool_call_id": "call_2",
+            "name": "correlation",
+            "arguments": {"x_column": "x", "y_column": "y", "method": "pearson"},
+            "result": {
+                "coefficient": None,
+                "sample_size": 1,
+                "status": "insufficient_samples",
+            },
+        }
+    )
+    api.service.return_value = payload
+    response = api.client.post("/analyze", json={"question": "问题"})
+    assert response.status_code == 200
+    assert response.json() == payload
+    json.dumps(response.json(), allow_nan=False)
+
+
+def test_schema_validation_does_not_claim_semantic_answer_quality(api):
+    api.service.return_value["answer"] = "(!256)"
+    response = api.client.post("/analyze", json={"question": "问题"})
+    assert response.status_code == 200
+    assert response.json()["answer"] == "(!256)"
