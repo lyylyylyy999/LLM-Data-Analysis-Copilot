@@ -31,6 +31,11 @@ api = [
     "python-multipart>=0.0.32,<0.1",
 ]
 
+frontend = [
+    "streamlit>=1.40,<2",
+    "httpx>=0.28,<1",
+]
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/data_copilot"]
 
