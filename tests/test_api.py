@@ -4,6 +4,7 @@ import copy
 import importlib.util
 import io
 import json
+import logging
 import os
 from pathlib import Path
 from types import SimpleNamespace
@@ -15,6 +16,14 @@ import pytest
 from fastapi import HTTPException, UploadFile
 from fastapi.exceptions import ResponseValidationError
 from fastapi.testclient import TestClient
+from openai import (
+    APIConnectionError,
+    APIStatusError,
+    APITimeoutError,
+    AuthenticationError,
+    InternalServerError,
+    RateLimitError,
+)
 
 from data_copilot.data_loader import load_csv as real_load_csv
 
@@ -234,7 +243,7 @@ def assert_invalid_service_response(api, location):
     with TestClient(api.module.app, raise_server_exceptions=False) as client:
         response = client.post("/analyze", json={"question": "一个有效问题"})
     assert response.status_code == 500
-    assert response.text == "Internal Server Error"
+    assert response.json() == {"detail": "分析服务内部错误"}
 
 
 @pytest.mark.parametrize("field", ["answer", "model", "finish_reason", "tool_results"])
@@ -514,3 +523,127 @@ def test_upload_os_error_remains_server_error_and_cleans_temp(api):
     assert caught.value is original
     api.service.assert_not_called()
     assert len(paths) == 1 and not paths[0].parent.exists()
+
+
+def model_failure(kind):
+    request = httpx.Request(
+        "POST",
+        "https://secret-upstream.invalid/private",
+        headers={"Authorization": "Bearer fake-secret-key"},
+    )
+    sensitive = "fake-secret-key private.csv upstream-private-detail"
+    if kind == "timeout":
+        return APITimeoutError(request=request), 504, "模型服务响应超时"
+    if kind == "connection":
+        return (
+            APIConnectionError(message=sensitive, request=request),
+            502,
+            "模型服务调用失败",
+        )
+    if kind in {"status", "authentication", "rate_limit", "upstream_internal"}:
+        exception_type, status = {
+            "status": (APIStatusError, 400),
+            "authentication": (AuthenticationError, 401),
+            "rate_limit": (RateLimitError, 429),
+            "upstream_internal": (InternalServerError, 500),
+        }[kind]
+        return (
+            exception_type(
+                sensitive,
+                response=httpx.Response(status, request=request),
+                body={"error": {"message": sensitive}},
+            ),
+            502,
+            "模型服务调用失败",
+        )
+    return (
+        ValueError(sensitive) if kind == "value" else RuntimeError(sensitive),
+        500,
+        "分析服务内部错误",
+    )
+
+
+@pytest.mark.parametrize("route", ["/analyze", "/analyze-file"])
+@pytest.mark.parametrize(
+    "kind",
+    [
+        "timeout",
+        "connection",
+        "status",
+        "authentication",
+        "rate_limit",
+        "upstream_internal",
+        "value",
+        "runtime",
+    ],
+)
+def test_server_error_classification_redaction_logging_and_cleanup(
+    api, route, kind, caplog
+):
+    original, expected_status, expected_detail = model_failure(kind)
+    api.service.side_effect = original
+    paths = track_uploaded_csv(api) if route == "/analyze-file" else []
+    with caplog.at_level(logging.ERROR, logger=api.module.__name__):
+        with TestClient(api.module.app, raise_server_exceptions=False) as client:
+            if route == "/analyze":
+                response = client.post(route, json={"question": "问题"})
+            else:
+                response = client.post(
+                    route,
+                    data={"question": "问题"},
+                    files={"file": ("tiny.csv", b"x\n1\n", "text/csv")},
+                )
+    assert response.status_code == expected_status
+    assert response.json() == {"detail": expected_detail}
+    assert response.headers["content-type"].startswith("application/json")
+    for sensitive in (
+        "fake-secret-key",
+        "private.csv",
+        "upstream-private-detail",
+        "secret-upstream",
+    ):
+        assert sensitive not in response.text
+    records = [
+        record for record in caplog.records if record.name == api.module.__name__
+    ]
+    assert len(records) == 1
+    record = records[0]
+    assert record.levelno == logging.ERROR
+    assert route in record.getMessage()
+    assert record.exc_info is not None
+    assert record.exc_info[1] is original
+    assert record.exc_info[2] is not None
+    api.service.assert_called_once()
+    if route == "/analyze-file":
+        assert len(paths) == 1 and not paths[0].parent.exists()
+
+
+def test_timeout_is_a_connection_error_but_maps_to_504(api):
+    original, _, _ = model_failure("timeout")
+    assert isinstance(original, APIConnectionError)
+    api.service.side_effect = original
+    with TestClient(api.module.app, raise_server_exceptions=False) as client:
+        response = client.post("/analyze", json={"question": "问题"})
+    assert response.status_code == 504
+
+
+def test_bad_response_schema_still_maps_to_safe_500(api):
+    api.service.return_value["answer"] = " "
+    with TestClient(api.module.app, raise_server_exceptions=False) as client:
+        response = client.post("/analyze", json={"question": "问题"})
+    assert response.status_code == 500
+    assert response.json() == {"detail": "分析服务内部错误"}
+
+
+def test_validation_and_csv_errors_do_not_trigger_server_error_logging(api, caplog):
+    api.load.side_effect = real_load_csv
+    with caplog.at_level(logging.ERROR, logger=api.module.__name__):
+        assert api.client.post("/analyze", json={"question": " "}).status_code == 422
+        response = api.client.post(
+            "/analyze-file",
+            data={"question": "问题"},
+            files={"file": ("tiny.csv", b"", "text/csv")},
+        )
+        assert response.status_code == 400
+    api.service.assert_not_called()
+    assert not any(record.name == api.module.__name__ for record in caplog.records)
