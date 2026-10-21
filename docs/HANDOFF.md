@@ -1,228 +1,158 @@
-# 当前代码与学习交接（更新至任务 06C）
+# 代码与学习交接
 
-更新日期：2026-10-14。统计模块与模型实验目前独立，学习任务 07 尚未实现。
+更新日期：2026-10-21。任务 01～20 已完成学习实现和对应验收；任务 21 仅已布置，评估目录和脚本尚未创建。当前代码是本地学习原型。
 
-## 模块职责和数据流
+## 阅读顺序与职责
 
-| 模块 | 职责 |
+| 建议顺序 | 文件 | 重点 |
+| --- | --- | --- |
+| 1 | `src/data_copilot/data_loader.py` | CSV 输入错误、类型推断与概览 |
+| 2 | `src/data_copilot/analysis_tools.py` | 可手工核对的真实计算及统计语义 |
+| 3 | `src/data_copilot/tool_registry.py` | Schema 与本地白名单、参数校验各自的作用 |
+| 4 | `src/data_copilot/analysis_service.py` | 消息历史、工具结果匹配、轮数上限和返回值 |
+| 5 | `examples/tool_execution.py` | 读取 CSV、调用服务与打印的分工 |
+| 6 | `src/data_copilot/api_schemas.py`、`api.py` | 请求/响应校验、上传临时文件及错误码 |
+| 7 | `frontend/app.py` | HTTP 调用、提交边界和错误展示 |
+| 8 | `tests/` | 如何通过模拟请求验证各层，而不调用真实模型 |
+
+早期学习代码仍保留：`llm_client.py`（流式 JSON Schema 调用）、`response_parser.py`（手写 JSON 校验）、`schemas.py`（三字段 AnalysisAnswer），以及 `hello_llm`、`pydantic_validation`、`structured_output` 示例。`analyze_with_llm` 演示固定统计结果交给模型解释；`tool_calling` 仅观察工具请求。它们不是当前 HTTP 服务的业务入口。
+
+## 当前数据流
+
+```text
+Streamlit 上传文件和问题
+  → POST /analyze-file
+  → 文件名/大小校验、服务端临时 CSV
+  → load_csv → DataFrame
+  → analyze_question(df, question)
+      → 模型接收问题、字段名称/类型和工具定义
+      → Python 校验模型提出的工具名称及 JSON 参数
+      → 绑定当前 df，执行真实统计函数
+      → assistant(tool_calls) + tool(tool_call_id, JSON结果) 追加历史
+      → 继续请求工具或返回最终正文；最多允许指定批次
+  → 临时文件清理、AnalyzeResponse 响应校验
+  → Streamlit 展示正文与工具详情
+```
+
+命令行复用相同服务但自行读取 CSV。`POST /analyze` 使用固定样例。DataFrame 不由模型提供，也不放入模型参数；模型仍会看到统计结果及分组值。核心统计和服务不打印，展示由 CLI/前端负责。
+
+## 统计接口
+
+以下统计函数返回 JSON 兼容字典，不修改输入 DataFrame。四种工具均可从 `data_copilot.analysis_tools` 导入。
+
+| 函数 | 参数 | 返回字段 |
+| --- | --- | --- |
+| `dataset_info(dataframe)` | DataFrame | `row_count`、`column_count`、`columns`、`dtypes`、`missing_values` |
+| `describe_numeric(dataframe, columns)` | 单个列名或列名序列；仅实数数值列 | `ddof=1`、`statistics`，按列返回 count/mean/std/min/25%/median/75%/max/unavailable_statistics |
+| `group_aggregate(dataframe, group_column, target_column, aggregation="mean")` | 分组列、数值目标列、mean/sum/count/min/max | 原参数及 `groups: [{group, value, status}]` |
+| `correlation(dataframe, x_column, y_column, method="pearson")` | 两个数值列及 pearson | 原参数及 `coefficient`、`sample_size`、`status` |
+
+`load_csv(file_path, *, encoding="utf-8-sig")` 返回 DataFrame；`dataset_overview(dataframe, *, preview_rows=5)` 返回基本信息和按行字典组织的 `preview`。
+
+描述统计忽略缺失值，标准差自由度为 1，分位数采用 Pandas 默认线性插值。分组 count 仅计目标非缺失值，保留缺失分组键；sum 使用至少一个有效值的约定，全缺失为 null。分组按首次出现顺序，仅输出实际观测类别。
+
+相关分析成对删除缺失值。`sample_size` 不等于任一单列的 count；少于 2 对为 `insufficient_samples`，任一列恒定为 `zero_variance`，浮点结果不可表示为 `nonfinite_result`，这些状态下 coefficient 为 null。零相关只表示无线性相关，不能据此否定非线性关系；工具不提供 p 值、置信区间或因果识别。
+
+NumPy 标量转换为 Python 标量，日期时间为 ISO 字符串。概览中的缺失/非有限值为 null；统计工具拒绝无穷输入，输出非有限值会附状态或不可用字段。有限数值不舍入，调用方使用 `json.dumps(..., allow_nan=False)` 验证。
+
+## 工具注册与服务接口
+
+```text
+execute_tool(dataframe, tool_name: str, arguments_json: str) -> dict[str, Any]
+analyze_question(dataframe, question: str, *, max_tool_rounds: int = 3) -> dict[str, Any]
+```
+
+`execute_tool` 只允许 dataset_info、describe_numeric、group_aggregate、correlation，不使用 eval/exec 或任意动态函数查找。模型侧参数约定如下，所有字段必填，禁止额外字段：
+
+| 工具 | 模型参数 |
 | --- | --- |
-| data_loader.py | 本地 CSV 校验与读取、数据集基本信息和预览 |
-| analysis_tools.py | 纯统计计算与参数校验，复用并公开导出 dataset_info |
-| llm_client.py | SYSTEM_PROMPT、配置检查、流式 ask_llm、正文与调用元数据 |
-| response_parser.py | 标准库 JSON 解析、手写字段与类型校验 |
-| schemas.py | Pydantic v2 AnalysisAnswer，严格类型、必填字段、空白摘要校验 |
-| examples/structured_output.py | 独立 ask_structured，非流式 SDK parse 与模型对象导出 |
-| examples/pydantic_validation.py | 五个 Pydantic 接口的纯本地演示 |
-| examples/hello_llm.py | 调用 ask_llm 后手写解析，并负责打印 |
-| examples/analyze_sales.py | 无模型请求的纯统计示例 |
+| dataset_info | `{}` |
+| describe_numeric | `{"columns":["sales"]}`；非空字符串数组 |
+| group_aggregate | `{"group_column":"region","target_column":"sales","aggregation":"mean"}` |
+| correlation | `{"x_column":"sales","y_column":"advertising_spend","method":"pearson"}` |
 
-__init__.py 只有包说明。全部测试离线；API 测试隔离 .env 并替换客户端或 HTTP 传输。
+Schema 帮助模型生成请求，不替代 Python 的类型、列名和允许值校验。统计函数支持单列字符串，不代表模型侧 columns 参数也允许字符串。
 
-调用流程：`load_csv(path)` → DataFrame → `dataset_overview(df)` 检查字段及缺失 → 选择统计函数并传入同一 df → 结构化字典 → 调用端 `json.dumps(..., allow_nan=False)`。统计核心无 print、全局 DataFrame、网络请求或 LLM 逻辑。
+`analyze_question` 调用时才读取配置并创建客户端；导入不读 CSV、不读 .env、不请求模型。问题和轮数提前校验；轮数必须为正整数，bool 不允许。
 
-## 公开接口
-
-以下签名省略完整模块前缀；返回值均为 `dict[str, Any]`，load_csv 除外。可从 `analysis_tools` 导入四个统计函数。
-
-### 文件读取与预览
-
-- `load_csv(file_path: str | Path, *, encoding: str = "utf-8-sig") -> pd.DataFrame`：只读本地 CSV。
-- `dataset_overview(dataframe: pd.DataFrame, *, preview_rows: int = 5)`：基本信息加 `preview`，预览为行字典列表，行数必须为非负整数。
-
-### A：dataset_info(dataframe: pd.DataFrame)
-
-```json
-{"row_count": 2, "column_count": 1, "columns": ["sales"],
- "dtypes": {"sales": "float64"}, "missing_values": {"sales": 1}}
-```
-
-dtype 值是 Pandas dtype 字符串，可能随推断结果和版本变化，不建议作为 LLM 的固定枚举。
-
-### B：describe_numeric(dataframe: pd.DataFrame, columns: str | Sequence[str])
-
-单列名或非空、不重复的列名序列；只接受实数数值列。
-
-```json
-{"ddof": 1, "statistics": {"sales": {
- "count": 3, "mean": 3.0, "std": 2.0, "min": 1.0,
- "25%": 2.0, "median": 3.0, "75%": 4.0, "max": 5.0,
- "unavailable_statistics": []}}}
-```
-
-缺失值不参与计算；std 使用 `ddof=1`，无法计算的量为 null。列表记录不可用的量，可能因为没有有效数据、样本不足或浮点溢出，不应把 null 解释为零。
-
-### C：group_aggregate(dataframe: pd.DataFrame, group_column: str, target_column: str, aggregation: str = "mean")
-
-aggregation 为 mean/sum/count/min/max。目标列须为实数数值列。分组键须是 Pandas 支持的可分组标量。
-
-```json
-{"group_column": "region", "target_column": "sales", "aggregation": "mean",
- "groups": [{"group": "East", "value": 100.0, "status": "ok"},
-            {"group": null, "value": null, "status": "undefined_or_nonfinite"}]}
-```
-
-固定 group/value 字段避免目标列与分组列同名导致冲突。缺失键保留，类别列仅输出观测到的类别；首次出现排序。count 忽略目标缺失值，sum 在全缺失组返回 null。空 DataFrame 返回空 groups。返回 status 区分正常和无法表示的值。
-
-### D：correlation(dataframe: pd.DataFrame, x_column: str, y_column: str, method: str = "pearson")
-
-```json
-{"x_column": "sales", "y_column": "advertising_spend", "method": "pearson",
- "coefficient": 1.0, "sample_size": 3, "status": "ok"}
-```
-
-成对删除缺失值。`sample_size` 为真实有效样本对数。只支持 pearson，同一数值列可与自身计算。状态为 ok、insufficient_samples（少于两对）、zero_variance（任一列恒定）、nonfinite_result（数值计算产生非有限值）；后三者 coefficient 均为 null。结果不说明因果。
-
-## 模型调用与回答接口
-
-### ask_llm(question: str) -> dict
-
-位于 llm_client.py，调用时读取配置并发出流式请求，导入不发请求。2026-10-15 起通过 response_format=json_schema 发送 AnalysisAnswer.model_json_schema() 生成的严格 Schema，并设置 enable_thinking=False；请求 include_usage，正确处理无 choices 的用量块。收集正文后使用 AnalysisAnswer.model_validate_json 校验，拒绝回答或校验失败时直接报错，不降级为提示词模式。模型必须支持 JSON Schema。
+返回结构：
 
 ```json
 {
-  "answer": "通过 Pydantic 校验的模型原始 JSON 正文",
-  "model": "服务实际返回的模型 ID",
+  "answer": "模型最终解释正文",
+  "model": "最终响应实际返回的模型名",
   "finish_reason": "stop",
-  "usage": {"prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30}
+  "tool_results": [
+    {"tool_call_id":"call_1","name":"dataset_info","arguments":{},
+     "result":{"row_count":40,"column_count":6}}
+  ]
 }
 ```
 
-数字仅为格式示例。model 未返回时为 null，不用配置模型伪装成实际模型；usage 未返回时为 null。函数内部不打印，异常不吞掉。answer 是原始字符串，不是已解析的回答字典。
+上述 result 仅节选格式；真实 dataset_info 还包含列名、类型和缺失数。普通工具服务正文不使用早期三字段 AnalysisAnswer。model 来自最终响应，不是假定配置中的模型名；当前服务不汇总 usage。
 
-### parse_analysis_answer(answer: str) -> dict
+每轮先校验整批调用的类型、非空 ID 及批内 ID 唯一，再按原顺序执行。相同工具可多次调用，每条结果通过自己的 tool_call_id 匹配，不能按工具名去重。单轮任一校验、计算或序列化失败即停止，不提交不完整批次，也不伪造成功结果。
 
-位于 response_parser.py，使用 json.loads，不删除代码围栏、不补字段、不修复 JSON。返回恰好包含以下字段的字典：
+工具轮数按批次计数：max_tool_rounds=2 最多执行两批工具，并允许第三次模型请求生成正文；若第三次仍请求工具，抛出 RuntimeError，不执行超限批次。默认最多 3 批、4 次服务层 create 调用；同批多个调用是普通 for 顺序执行，parallel_tool_calls=True 不让 Python 自动并发。SDK 的底层重试可能增加网络尝试次数。
 
-```json
-{
-  "summary": "直接结论",
-  "explanation": "必要的说明",
-  "missing_information": []
-}
-```
+每次模型请求携带完整 system/user/assistant/tool 历史。该历史只存在本次函数调用，不保存到下一次用户请求。已有足够信息时可以首轮直接回答，tool_results=[]，不会额外请求。
 
-summary 为非空白字符串，explanation 为字符串且可为空，missing_information 为字符串列表且可为空；禁止额外字段。解析和展示分离，原文中的合法空格不会被悄悄去掉。
+## HTTP、上传和异常边界
 
-### AnalysisAnswer
+请求模型 AnalyzeRequest 仅接收非空白字符串 question；AnalyzeResponse 和嵌套 ToolExecutionResult 采用严格类型并禁止额外字段。answer/model/tool_call_id/name 不得全空白，finish_reason 仅允许 stop。统计参数和结果仍保留通用字典，尚未逐种定义 Pydantic 类型。
 
-位于 schemas.py，三个字段无默认值，ConfigDict(strict=True, extra="forbid")。summary 的 field_validator 只检查 .strip() 是否非空，返回原始 value。
+- 请求校验失败：422，路由未执行，不读取 CSV 或请求模型。
+- 响应校验失败：500，服务已经返回了无效数据，属于服务端问题。
+- 模型生成的工具参数校验：执行前发生，不能用响应模型代替。
+- JSON Schema/Pydantic/HTTP 200 均不保证统计解释正确，非空无意义文本仍可能通过。
 
-| 方法 | 输入与结果 |
+上传字段为 file、question；最大 5 MiB，应用最多读上限加 1 字节，超过返回 413。缺失文件字段为 422；缺失文件名、非法后缀、空内容、CSV 格式和解码错误为 400。默认 UTF-8-sig，不推断编码。只有表头可以产生零行 DataFrame。
+
+文件使用 TemporaryDirectory 和服务端固定文件名 uploaded.csv。用户文件名仅校验后缀，避免路径遍历或同名覆盖。读取、分析成功或失败都清理临时目录；不持久化上传，不生成数据集 ID。该 5 MiB 检查发生在框架解析上传后，并不替代网关/服务器层的请求体限制。
+
+HTTP 层先识别 APITimeoutError（APIConnectionError 子类）为 504，再将 APIConnectionError/APIStatusError 映射为 502，其他未处理异常为 500。上游 401 是后端调用模型的认证问题，不代表本接口用户未登录。固定服务端错误 detail 不暴露原始异常，logger.error 使用 exc_info 保留堆栈；日志仍需按服务端敏感信息处理。
+
+统计与服务保持真实异常传播，CLI 不依赖 HTTPException。只在上传的 load_csv 边界将 UnicodeError/ValueError 转为 400，后续分析 ValueError 仍为 500。
+
+| 底层异常 | 常见触发条件 |
 | --- | --- |
-| AnalysisAnswer.model_validate(data) | 校验 Python 数据，返回模型对象 |
-| AnalysisAnswer.model_validate_json(text) | 解析并校验 JSON，返回模型对象 |
-| instance.model_dump() | 导出字典 |
-| instance.model_dump_json() | 导出 JSON 字符串 |
-| AnalysisAnswer.model_json_schema() | 导出 JSON Schema 字典 |
+| FileNotFoundError / OSError / PermissionError | 路径缺失、读取或临时文件权限问题 |
+| CSVValidationError（ValueError 子类） | 空文件、重复/空列名、字段数不匹配、NUL 或无法解析 |
+| UnicodeDecodeError / LookupError | 文件编码不符、无效编码名 |
+| TypeError / ValueError | 非法 DataFrame、列、列类型、聚合方法或参数 |
+| json.JSONDecodeError | 工具 arguments 或早期回答解析的 JSON 不合法 |
+| RuntimeError | 缺配置、超轮数、空/截断/拒绝/不一致的模型响应 |
+| Pydantic / 响应校验异常 | 字段、类型、额外内容或文本约束不符 |
+| SDK 连接、状态、超时异常 | 模型调用失败，服务层保留原始异常 |
 
-自定义 summary 校验不会自动变成同等的 Schema 约束；字符串类型本身允许纯空白。本地校验与接口约束的作用不同。模型结构校验也不判断统计内容是否正确。
+## 前端与代理修正
 
-### ask_structured(question: str) -> dict
+frontend/app.py 不导入服务函数，不持有模型密钥。submit_analysis 校验输入后用 httpx.post 发送 multipart；validate_analysis_response 验证最小返回协议；main 负责表单和展示。Streamlit rerun 未提交时不会请求；不能把函数放在提交条件之外。
 
-目前位于 examples/structured_output.py，是独立学习实验，尚未提取为包级服务。流程：检查配置 → SDK chat.completions.parse(response_format=AnalysisAnswer) → 检查结束状态与 refusal → 检查 message.parsed 是 AnalysisAnswer → model_dump。
+前端连接/读取/写入/连接池超时分别为 10/300/30/10 秒。连接失败和超时有不同提示，HTTP 错误不作为成功分析展示；正文使用默认安全 Markdown，不开启 unsafe_allow_html。
 
-返回三字段回答字典，格式与上例一致，但不包含 ask_llm 的模型名/usage 等元数据。SDK 自动从 Pydantic 类生成严格 Schema，不再维护手写 ANALYSIS_SCHEMA。此路径非流式，没有显式打开思考模式；模型默认设置取决于服务。只发送一次请求，不是多轮对话。
+访问 127.0.0.1、localhost、::1 时使用 trust_env=False，仅绕过前端该次请求的环境代理；远程后端仍允许环境代理，后端 SDK 和系统 TUN 设置未更改。曾在 Clash 开启、FastAPI 停止时出现代理网关 502 被误标为模型错误；修正后用户已确认提示正确。未知 502/504 显示后端或代理网关错误；已知后端 JSON detail 才映射为模型服务错误说明，该识别不是来源认证机制。
 
-### 当前两条模型路径
+## 旧结构化学习接口
 
-- hello_llm：ask_llm → 流式 create 的接口级 JSON Schema 约束 → Pydantic 本地校验 → 原始 answer 字符串 → parse_analysis_answer → 展示。保留原有返回格式与手写解析示例。
-- structured_output：SDK parse → 自动 Schema 约束 → Pydantic 本地校验 → 回答字典 → 展示。拒绝、截断和校验失败不降级到 create。
+- ask_llm(question)：流式 create + AnalysisAnswer JSON Schema，拼接最终正文并本地校验；返回 answer 原始 JSON 字符串、实际 model、finish_reason 和 usage，usage 缺失为 None，不打印推理内容。
+- parse_analysis_answer(answer)：手写 json.loads 和三字段校验，不修复非法 JSON，不删除围栏。
+- AnalysisAnswer：summary/explanation/missing_information 全必填，严格类型、禁止额外字段；summary 非空白，explanation 可空。
+- examples.structured_output.ask_structured：SDK parse(response_format=AnalysisAnswer)，返回 model_dump 的三字段字典。当前 main 只发一个问题，不会遍历 QUESTIONS。
 
-现有 response_parser 仍保留，未被 Pydantic 全局替换。统计结果也尚未进入任一模型请求；任务 07 将首次连接它们。
+这些是并列学习实验，当前业务服务不通过 ask_llm 或 ask_structured 间接执行工具。自定义本地校验不一定等价于远端 Schema 约束。
 
-### LLM 配置和异常
+## 已验证与尚未完成
 
-DASHSCOPE_API_KEY、DASHSCOPE_BASE_URL、DASHSCOPE_MODEL 都必填，调用时 load_dotenv()，已有进程变量按 dotenv 默认行为优先。timeout=60.0，未额外设置重试次数；SDK 可能执行其默认重试，业务层没有自行回退或修补。
+2026-10-21 最近代码检查：675 项离线测试通过，Ruff/mypy/格式检查通过，分别检查 30 个源文件和 34 个格式文件。测试包含统计手算样例、SDK/HTTP 模拟、有限轮控制、上传清理、响应校验和模拟页面组件。未通过这些测试调用真实模型。
 
-| 异常/状态 | 触发条件与当前行为 |
-| --- | --- |
-| ValueError | 两个调用函数的空白问题；手写解析的字段/类型/空摘要错误 |
-| RuntimeError | 配置缺失、流式结束标记异常、空正文；结构化实验无 choices、拒绝或无有效 parsed |
-| json.JSONDecodeError | response_parser 中 JSON 文本非法，保留原始异常 |
-| pydantic.ValidationError | model_validate_json 的 JSON/字段/摘要错误；SDK parse 可能直接传出该异常 |
-| SDK API/连接/超时异常 | 原样传出，保留真实失败原因 |
-| SDK 长度限制/内容过滤异常 | parse 可能在返回 completion 前抛出，不应只依赖返回后的 finish_reason 检查 |
+用户已提供真实统计、工具执行、接口响应及页面截图；正常上传/零方差/空文件状态码分别为 200/200/400。Clash 开启且后端停服的提示已复测。人工验收不等于全流程浏览器自动化或模型准确率评估。
 
-两条调用函数都不打印；示例负责展示。这样同一返回值可以用于测试、命令行或后续业务，而不绑定到某种展示方式。
+待处理：
 
-## 异常与数据约定
+1. 任务 21：四个基础评估案例，区分预期工具/参数、真实统计值与人工回答质量，尚未创建 evals 或脚本。
+2. 非空异常正文 "(!256)" 曾出现一次，重试正常，根因未确认；缺失值解释也曾出现措辞错误，应纳入评估记录。
+3. OpenAI SDK 实装 3.14.1 超出声明 openai>=1.60,<3，需学习者选定版本后同步约束并重新验证。
+4. 无跨请求聊天、认证、持久化、生产部署、完整系统评估或 RAG。CSV 完整加载，类型/缺失推断可能影响前导零及 NA 字符串，不自动清洗。
 
-| 异常 | 触发条件 |
-| --- | --- |
-| FileNotFoundError | 文件不存在 |
-| ValueError | 目录路径、非 CSV 扩展名、不存在的字段、非实数数值列、无穷输入、不支持的操作、空或重复列选择、无效 DataFrame 列名、负预览行数 |
-| CSVValidationError（ValueError 子类） | 空文件、空列名、重复列名、列数不匹配、无法解析的 CSV |
-| UnicodeDecodeError | 指定编码无法解码文件，保留原始异常 |
-| LookupError | 编码名称无效 |
-| OSError / PermissionError | 文件系统或权限问题，保留原始异常 |
-| TypeError | 非 DataFrame 输入、预览行数不是整数、无法序列化的对象等 |
-
-CSV parser 错误使用 `raise ... from exc` 保留原因。默认编码 utf-8-sig 兼容 BOM，可指定 gbk；不推断编码、不改列名。Pandas 的类型和 NA 推断是读取语义的一部分，包括 NA/NULL 字符串会视为缺失，数字 ID 可能失去前导零。若有业务语义要求，下一步需设计显式 dtype/NA 参数，而不是任意清洗。
-
-JSON 转换由私有 `_json_value` 统一处理：NumPy 标量转原生类型，NaN/Infinity/NA/NaT 为 null，日期时间 ISO 字符串，时长为字符串。概览不额外记录非有限值原因，查看原 DataFrame 可区分其来源；统计输入无穷值直接报错，输出计算溢出由状态或不可用量列表标识。有限数值不舍入；仍受浮点精度和极端数值溢出影响。所有函数只读，不填补缺失或改变输入。
-
-## 后续如何复用
-
-学习任务 01～06C 已完成基础调用、提示词、解析和 Pydantic/SDK 结构化实验。下一步任务 07 先固定调用统计函数，再将结果作为模型输入，不让模型选择或执行工具。
-
-Phase 3 可复用所有统计函数：模型提出函数名称和列名参数，Python 执行层做白名单校验，绑定当前数据集的 DataFrame，再调用对应函数，将结构化结果发送给模型。DataFrame 应由程序持有，不放入模型生成的 JSON 参数。工具定义只描述 columns/group_column/target_column/aggregation/x_column/y_column 等可序列化参数；不要让模型执行任意 Python 或任意读取路径。错误转换应保留真实原因，不伪造结果。以上是未来 Function Calling 接入建议；目前虽有单次模型调用，但没有工具注册、模型选择统计工具或 Agent 实现。
-
-## 当前限制和阅读顺序
-
-CSV 校验一遍、读取一遍，无大小上限且完整加载内存，读取时文件须稳定；只支持本地逗号 CSV，无远程 URL/Excel/自动编码推断。数值工具不自动转换对象列，时间数据和复数不作为数值分析对象。输入列名必须唯一非空字符串；组键需可哈希和可序列化。没有持久化、上传接口、认证、业务缓存或前端；已有 LLM 调用还未接入统计数据流。
-
-建议先读 `data_loader.py`，理解错误边界与 DataFrame；再读 `analysis_tools.py`，理解工具签名、缺失值和计算约定；随后读统计测试，用手算核对结果；再读 llm_client、response_parser、schemas 和 structured_output 示例，比较原始字符串与模型对象。对应测试演示了如何隔离 API。最后读 pyproject 和 README，理解安装与验证命令。配置沿用现有 DASHSCOPE 环境变量，真实 .env 已忽略。
-
-CSV 含 NUL（空字节）时会抛出 CSVValidationError，防止底层读取器截断内容而丢失数据。
-
-## 初次 Phase 0 验收（2026-10-13，历史记录）
-
-环境：Windows、Python 3.13.9、uv 0.13.0、Pandas 3.0.6、NumPy 2.5.4。
-
-- `python -m uv sync --locked`：依赖安装成功，uv.lock 已保留。
-- `python -m uv run pytest -q`：46 passed，0 failed。
-- `python -m uv run ruff check .` 与 `python -m uv run ruff format --check .`：通过。
-- 包从 editable src 路径成功导入；示例 CSV 为 40 行、6 列。
-- 缺失数量：region 1、sales 2、advertising_spend 2，其余 0。
-- sales 均值 694.6973684210526；sales 与 advertising_spend 的 Pearson 系数 0.9409742630262548，有效样本 36。
-- 示例的均值、样本标准差、各地区均值和相关性使用标准库 csv/statistics 独立核对；所有工具结果通过 `json.dumps(..., allow_nan=False)`。
-- Git 已初始化，文件尚未提交，未创建远程仓库、commit 或 push。真实环境文件、虚拟环境、缓存和非示例数据均被忽略。
-
-首次 pytest 因系统临时目录权限出现 setup errors，现通过工作区内的专用缓存目录解决；换行测试显式禁用 Windows 自动转换，未削弱断言。最终无未解决的 Phase 0 问题。最低 Python 3.11 的兼容性由语法/依赖约束声明，本次没有单独运行 3.11 解释器。
-
-## 开发环境约定
-
-后续统一使用 conda 的 `LLM` 环境，本机 Python 3.12.13。先在项目目录执行 `conda run -n LLM python -m pip install -e ".[dev,llm]"`；测试用 `conda run -n LLM python -m pytest -q`，代码检查用同一环境的 `python -m ruff`。完整命令见 README。
-
-开发依赖改为 pyproject 的 dev extra，pip 可以直接安装，无需 uv。新机器使用 README 中的 conda create 命令建立环境，项目依赖只在 pyproject.toml 中声明。旧 uv.lock 移除，旧验收记录保留用于追溯。
-
-`examples/analyze_sales.py` 是纯 Pandas 示例，默认从脚本所在仓库定位模拟数据，也支持显式 CSV 路径。它只负责调用和 JSON 输出，没有模型或 API 请求。
-
-工具参数类型不正确时抛出 TypeError：包括非字符串列名、不是字符串序列的 columns 和非字符串操作名；空字符串、空列集合、重复字段、未知操作等抛出 ValueError。
-
-## conda 迁移与仓库优化验收（2026-10-13）
-
-- 解释器已确认：`D:\Anaconda_envs\envs\LLM\python.exe`，Python 3.12.13；Pandas 3.0.6、NumPy 2.5.3。
-- `conda run -n LLM python -m pip install -e ".[dev]"` 成功；复用环境中现有依赖，没有升级 Python 或已有分析依赖。
-- `conda run -n LLM python -m pytest -q`：59 passed，0 failed。
-- 同环境 Ruff 静态检查与格式检查通过，`python -m pip check` 返回 No broken requirements found。
-- 示例从仓库外工作目录运行成功；40 行、6 列，相关性有效样本 36，JSON 严格序列化通过。
-- 新增参数类型回归及示例数据回归测试。
-- 保留现有目录和用户的工作区编辑器配置；未创建 commit、远程仓库或 push。新机器的 conda 环境创建命令已提供，但未另建环境执行验证。
-
-## 仓库精简
-
-移除可选的编辑器与 Git 换行配置、空环境模板及单独的 conda 环境描述文件。保留 pyproject.toml 管理依赖、Ruff 和 pytest 配置；README 记录环境安装步骤；AGENTS.md 保存 conda LLM 和开发边界约定；TASKS.md 保留阶段规划。
-
-## 任务 06C 后的最新验收（2026-10-14）
-
-- 全部 205 项测试通过，Ruff 通过，mypy 检查 16 个源文件无错误。
-- 实际环境：Python 3.12.13、OpenAI SDK 3.14.1、Pydantic 2.13.5、Pandas 3.0.6、NumPy 2.5.3、pytest 9.1.1、mypy 2.3.1、Ruff 0.16.8。
-- tests/test_llm_client：流式拼接、配置、usage 缺失、真实异常保留、导入与打印边界。
-- tests/test_response_parser：非法 JSON、字段/类型错误、原文保留。
-- tests/test_schemas：严格类型、必填/额外字段、空摘要、模型导出和 Schema。
-- tests/test_structured_output：parse 调用、缺失 parsed、refusal、无回退，以及真实 SDK + MockTransport 的 Schema 发送和本地校验。HTTP 在内存中模拟，不访问真实服务。
-- 本轮没有发送真实 API 请求；原生结构化模式三题结果仍待归档。当前 environment 的 SDK 3.14.1 超出 pyproject 的 openai>=1.60,<3，依赖一致性与声明范围内的版本验证待单独处理。
-- 目前 SYSTEM_PROMPT 含角色、数据真实性、统计解释、信息不足处理和 JSON 格式要求，但尚未恢复前轮关于未经计算不编造系数/预测值、显著性与因果识别、有效记录数的详细优化规则。不要把曾经的提示词修改记录当成当前内容。
-
-上述数字为检查快照，不是模型准确率或真实接口成功率。历史 Phase 0 验收段落保留作追溯，不表示当前仍使用 uv 或没有 LLM 实现。
+当前只声明 Python 3.11+；实际验收 Python 3.12.13，未单独验证 3.11。安装/启动/检查命令见 README；依赖只由 pyproject 管理。早期 uv 初始化属于历史，当前统一 conda LLM，已移除 uv.lock。
