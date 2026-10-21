@@ -2,6 +2,7 @@
 
 import copy
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -11,6 +12,7 @@ from unittest.mock import Mock
 import httpx
 import pandas as pd
 import pytest
+from fastapi import HTTPException, UploadFile
 from fastapi.exceptions import ResponseValidationError
 from fastapi.testclient import TestClient
 
@@ -336,3 +338,179 @@ def test_schema_validation_does_not_claim_semantic_answer_quality(api):
     response = api.client.post("/analyze", json={"question": "问题"})
     assert response.status_code == 200
     assert response.json()["answer"] == "(!256)"
+
+
+def track_uploaded_csv(api):
+    paths = []
+
+    def load(path):
+        paths.append(path)
+        assert path.is_file()
+        assert path.name == "uploaded.csv"
+        return real_load_csv(path)
+
+    api.load.side_effect = load
+    return paths
+
+
+@pytest.mark.parametrize("filename", ["tiny.csv", "tiny.CSV", "../../tiny.csv"])
+def test_upload_uses_real_user_data_and_cleans_temp_file(api, filename):
+    paths = track_uploaded_csv(api)
+    content = b"x,y\n1,2\n1,3\n1,4\n"
+    response = api.client.post(
+        "/analyze-file",
+        data={"question": "计算相关性"},
+        files={"file": (filename, content, "text/csv")},
+    )
+    assert response.status_code == 200
+    assert response.json() == api.payload
+    frame, question = api.service.call_args.args
+    assert frame.to_dict(orient="list") == {"x": [1, 1, 1], "y": [2, 3, 4]}
+    assert question == "计算相关性"
+    assert len(paths) == 1
+    assert paths[0] != api.module.SAMPLE_CSV_PATH
+    assert not paths[0].exists() and not paths[0].parent.exists()
+
+
+@pytest.mark.parametrize("filename", ["tiny.txt", "tiny", "tiny.csv.exe", "", None])
+def test_upload_invalid_filename_is_400_without_csv_or_service(api, filename):
+    response = api.client.post(
+        "/analyze-file",
+        data={"question": "问题"},
+        files={"file": (filename, b"x\n1\n", "text/csv")},
+    )
+    assert response.status_code == 400
+    api.load.assert_not_called()
+    api.service.assert_not_called()
+
+
+@pytest.mark.parametrize("question", ["", " \n\t"])
+def test_upload_blank_question_is_422_without_processing_csv(api, question):
+    response = api.client.post(
+        "/analyze-file",
+        data={"question": question},
+        files={"file": ("tiny.csv", b"x\n1\n", "text/csv")},
+    )
+    assert response.status_code == 422
+    api.load.assert_not_called()
+    api.service.assert_not_called()
+
+
+@pytest.mark.parametrize("missing", ["file", "question"])
+def test_upload_missing_required_field_is_422(api, missing):
+    kwargs = {
+        "data": {"question": "问题"},
+        "files": {"file": ("tiny.csv", b"x\n1\n", "text/csv")},
+    }
+    kwargs.pop("files" if missing == "file" else "data")
+    response = api.client.post("/analyze-file", **kwargs)
+    assert response.status_code == 422
+    api.load.assert_not_called()
+    api.service.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        b"",
+        b"\n\n",
+        b"x,x\n1,2\n",
+        b"x,\n1,2\n",
+        b"x,y\n1,2,3\n",
+        b'x,y\n"unterminated,2\n',
+        b"x\n\xff\n",
+    ],
+)
+def test_invalid_csv_is_400_and_temp_file_is_removed(api, content):
+    paths = track_uploaded_csv(api)
+    response = api.client.post(
+        "/analyze-file",
+        data={"question": "问题"},
+        files={"file": ("tiny.csv", content, "text/csv")},
+    )
+    assert response.status_code == 400
+    assert "无效 CSV" in response.json()["detail"]
+    api.service.assert_not_called()
+    assert len(paths) == 1
+    assert not paths[0].parent.exists()
+
+
+@pytest.mark.parametrize("extra_byte", [False, True])
+def test_upload_exact_size_boundary(api, extra_byte):
+    assert api.module.MAX_UPLOAD_BYTES == 5 * 1024 * 1024
+    content = b"x\n" + b"a" * (api.module.MAX_UPLOAD_BYTES - 2 + int(extra_byte))
+    response = api.client.post(
+        "/analyze-file",
+        data={"question": "问题"},
+        files={"file": ("tiny.csv", content, "text/csv")},
+    )
+    assert response.status_code == (413 if extra_byte else 200)
+    if extra_byte:
+        api.load.assert_not_called()
+        api.service.assert_not_called()
+    else:
+        api.load.assert_called_once()
+        api.service.assert_called_once()
+        assert not api.load.call_args.args[0].parent.exists()
+
+
+def test_upload_reads_at_most_limit_plus_one_byte(api):
+    stream = Mock(wraps=io.BytesIO(b"x\n1\n"))
+    upload = UploadFile(file=stream, filename="tiny.csv")
+    assert api.module.analyze_file(upload, "问题") == api.payload
+    stream.read.assert_called_once_with(api.module.MAX_UPLOAD_BYTES + 1)
+
+
+def test_blank_question_prevents_even_file_content_read(api):
+    stream = Mock(side_effect=AssertionError("Must not read invalid request"))
+    upload = UploadFile(file=stream, filename="tiny.csv")
+    with pytest.raises(HTTPException) as caught:
+        api.module.analyze_file(upload, " \n")
+    assert caught.value.status_code == 422
+    stream.read.assert_not_called()
+    api.load.assert_not_called()
+    api.service.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "exception", [ValueError("analysis failed"), RuntimeError("model failed")]
+)
+def test_upload_analysis_error_is_not_csv_error_and_temp_is_cleaned(api, exception):
+    paths = track_uploaded_csv(api)
+    api.service.side_effect = exception
+    with pytest.raises(type(exception)) as caught:
+        api.client.post(
+            "/analyze-file",
+            data={"question": "问题"},
+            files={"file": ("tiny.csv", b"x\n1\n", "text/csv")},
+        )
+    assert caught.value is exception
+    assert len(paths) == 1 and not paths[0].parent.exists()
+    with TestClient(api.module.app, raise_server_exceptions=False) as client:
+        response = client.post(
+            "/analyze-file",
+            data={"question": "问题"},
+            files={"file": ("tiny.csv", b"x\n1\n", "text/csv")},
+        )
+    assert response.status_code == 500
+    assert all(not path.parent.exists() for path in paths)
+
+
+def test_upload_os_error_remains_server_error_and_cleans_temp(api):
+    paths = []
+    original = PermissionError("cannot read temporary file")
+
+    def fail(path):
+        paths.append(path)
+        raise original
+
+    api.load.side_effect = fail
+    with pytest.raises(PermissionError) as caught:
+        api.client.post(
+            "/analyze-file",
+            data={"question": "问题"},
+            files={"file": ("tiny.csv", b"x\n1\n", "text/csv")},
+        )
+    assert caught.value is original
+    api.service.assert_not_called()
+    assert len(paths) == 1 and not paths[0].parent.exists()
