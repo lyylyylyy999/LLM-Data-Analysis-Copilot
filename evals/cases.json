@@ -1,0 +1,296 @@
+{
+  "version": 2,
+  "cases": [
+    {
+      "id": "dataset_size",
+      "csv": "data/samples/sales.csv",
+      "question": "这份数据有多少行、多少列？",
+      "expected_tools": [
+        {
+          "name": "dataset_info",
+          "arguments": {},
+          "checks": {
+            "row_count": 40,
+            "column_count": 6
+          }
+        }
+      ],
+      "human_review": [
+        "回答明确给出 40 行、6 列，没有编造其他统计值。",
+        "回答内容与工具结果一致，没有异常字符或无意义文本。"
+      ]
+    },
+    {
+      "id": "sales_descriptive",
+      "csv": "data/samples/sales.csv",
+      "question": "sales 的非缺失数量、均值和样本标准差是多少？",
+      "expected_tools": [
+        {
+          "name": "describe_numeric",
+          "arguments": {
+            "columns": [
+              "sales"
+            ]
+          },
+          "checks": {
+            "ddof": 1,
+            "statistics.sales.count": 38,
+            "statistics.sales.mean": {
+              "value": 694.6973684210526,
+              "abs_tol": 1e-06
+            },
+            "statistics.sales.std": {
+              "value": 203.19443954783284,
+              "abs_tol": 1e-06
+            }
+          }
+        }
+      ],
+      "human_review": [
+        "count=38 是非缺失数量，不能说成总行数。",
+        "均值与样本标准差数值正确，标准差说明 ddof=1。",
+        "不虚构缺失原因或额外统计结论。"
+      ]
+    },
+    {
+      "id": "pearson_correlation",
+      "csv": "data/samples/sales.csv",
+      "question": "sales 与 advertising_spend 的 Pearson 相关系数和有效样本量是多少？能证明因果吗？",
+      "expected_tools": [
+        {
+          "name": "correlation",
+          "arguments": {
+            "x_column": "sales",
+            "y_column": "advertising_spend",
+            "method": "pearson"
+          },
+          "checks": {
+            "method": "pearson",
+            "status": "ok",
+            "sample_size": 36,
+            "coefficient": {
+              "value": 0.940974,
+              "abs_tol": 5e-05
+            }
+          }
+        }
+      ],
+      "human_review": [
+        "有效样本量 36 是两列同时非缺失的观测对数。",
+        "相关性不证明广告投入造成销售额增长。",
+        "不声称计算了未提供的 p 值或置信区间。"
+      ]
+    },
+    {
+      "id": "zero_variance",
+      "csv": "evals/fixtures/zero_variance.csv",
+      "question": "请计算 x 与 y 的 Pearson 相关系数，并解释无法计算的原因。",
+      "expected_tools": [
+        {
+          "name": "correlation",
+          "arguments": {
+            "x_column": "x",
+            "y_column": "y",
+            "method": "pearson"
+          },
+          "checks": {
+            "status": "zero_variance",
+            "coefficient": null,
+            "sample_size": 3
+          }
+        }
+      ],
+      "human_review": [
+        "将 null 解释为无法计算，而不是系数为零。",
+        "说明 x 列为常量、方差为零，Pearson 分母为零。",
+        "有效样本对数为 3，不声称显著性或因果关系。"
+      ]
+    },
+    {
+      "id": "region_mean",
+      "csv": "data/samples/sales.csv",
+      "question": "请按 region 分组计算 sales 的平均值，保留 region 缺失的分组，并列出每个地区的均值。",
+      "expected_tools": [
+        {
+          "name": "group_aggregate",
+          "arguments": {
+            "group_column": "region",
+            "target_column": "sales",
+            "aggregation": "mean"
+          },
+          "checks": {
+            "group_column": "region",
+            "target_column": "sales",
+            "aggregation": "mean"
+          },
+          "expected_groups": [
+            {
+              "group": "East",
+              "value": {
+                "value": 680.375,
+                "abs_tol": 1e-06
+              }
+            },
+            {
+              "group": "West",
+              "value": {
+                "value": 707.5,
+                "abs_tol": 1e-06
+              }
+            },
+            {
+              "group": "North",
+              "value": {
+                "value": 686.5,
+                "abs_tol": 1e-06
+              }
+            },
+            {
+              "group": "South",
+              "value": {
+                "value": 699.3333333333334,
+                "abs_tol": 1e-06
+              }
+            },
+            {
+              "group": null,
+              "value": {
+                "value": 721.5,
+                "abs_tol": 1e-06
+              }
+            }
+          ]
+        }
+      ],
+      "human_review": [
+        "按地区解释 sales 的非缺失值均值，不能将均值说成总和或非缺失数量。",
+        "保留 region 缺失的分组（null），不称其为字符串 \"null\" 或省略该组。",
+        "地区均值的差异是描述性结果，不能直接解释为地区导致销售额变化。"
+      ]
+    },
+    {
+      "id": "category_sum",
+      "csv": "data/samples/sales.csv",
+      "question": "请按 category 分组计算 Books、Electronics 和 Home 的 sales 总和。",
+      "expected_tools": [
+        {
+          "name": "group_aggregate",
+          "arguments": {
+            "group_column": "category",
+            "target_column": "sales",
+            "aggregation": "sum"
+          },
+          "checks": {
+            "group_column": "category",
+            "target_column": "sales",
+            "aggregation": "sum"
+          },
+          "expected_groups": [
+            {
+              "group": "Books",
+              "value": {
+                "value": 9085.5,
+                "abs_tol": 1e-06
+              }
+            },
+            {
+              "group": "Electronics",
+              "value": {
+                "value": 8935.0,
+                "abs_tol": 1e-06
+              }
+            },
+            {
+              "group": "Home",
+              "value": {
+                "value": 8378.0,
+                "abs_tol": 1e-06
+              }
+            }
+          ]
+        }
+      ],
+      "human_review": [
+        "把 Books、Electronics、Home 的 sum 解释为销售额总和，而不是均值或行数。",
+        "不要把缺失的 sales 当作实际的零销售额，并且不虚构额外类别。",
+        "不同类别的销售额总和差异不能直接解释为因果关系。"
+      ]
+    },
+    {
+      "id": "group_missing_sum_count",
+      "csv": "evals/fixtures/group_missing.csv",
+      "question": "请分别计算每个地区的销售额总和，以及非缺失销售额记录数。保留地区缺失组，并解释 West 与 North 的总和为什么不同。",
+      "expected_tools": [
+        {
+          "name": "group_aggregate",
+          "arguments": {
+            "group_column": "region",
+            "target_column": "sales",
+            "aggregation": "sum"
+          },
+          "checks": {
+            "group_column": "region",
+            "target_column": "sales",
+            "aggregation": "sum"
+          },
+          "expected_groups": [
+            {
+              "group": "East",
+              "value": 10
+            },
+            {
+              "group": "West",
+              "value": null
+            },
+            {
+              "group": "North",
+              "value": 0
+            },
+            {
+              "group": null,
+              "value": 20
+            }
+          ]
+        },
+        {
+          "name": "group_aggregate",
+          "arguments": {
+            "group_column": "region",
+            "target_column": "sales",
+            "aggregation": "count"
+          },
+          "checks": {
+            "group_column": "region",
+            "target_column": "sales",
+            "aggregation": "count"
+          },
+          "expected_groups": [
+            {
+              "group": "East",
+              "value": 1
+            },
+            {
+              "group": "West",
+              "value": 0
+            },
+            {
+              "group": "North",
+              "value": 2
+            },
+            {
+              "group": null,
+              "value": 1
+            }
+          ]
+        }
+      ],
+      "human_review": [
+        "count 是各组 sales 非缺失值数量，不是组内的总行数；East=1、West=0、North=2、缺失地区=1。",
+        "West 的 sales 全缺失，因此 sum=null（无法从有效值求和），不是数值 0。",
+        "North 的 sales 是 5 和 -5，两笔有效数值相加恰好为 0，与 West 的全缺失不同。",
+        "region 缺失的那条记录应形成单独的 null 分组（sum=20、count=1）。",
+        "分组之间的差异不构成因果证明。"
+      ]
+    }
+  ]
+}
