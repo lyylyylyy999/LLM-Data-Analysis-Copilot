@@ -1,4 +1,4 @@
-# 模型效果评估（学习任务 21–22）
+# 模型效果评估（学习任务 21–23）
 
 本目录目前包含 **7 个小规模评估案例**：任务 21 的数据规模、描述统计、Pearson 相关、零方差，以及任务 22 的地区均值、类别总和、分组 `sum`/`count` 缺失值语义。评估脚本仍直接调用 `data_copilot.analysis_service.analyze_question()`；**不复制分析流程、不修改统计工具、不增加模型调用方式**。
 
@@ -11,6 +11,7 @@
 | `evals/fixtures/zero_variance.csv` | `x` 恒为 10 的零方差模拟数据 | 是 |
 | `evals/fixtures/group_missing.csv` | 测试全缺失总和与真实零的模拟数据 | 是 |
 | `examples/run_evaluation.py` | 逐个运行案例、自动检查工具结果、生成 JSON 报告 | 是 |
+| `examples/review_evaluation.py` | 不调用模型，逐案例记录人工审核结论并生成独立报告 | 是 |
 | `evals/reports/` | 本地生成的报告（包含模型回答与工具结果） | 否，已加入 `.gitignore` |
 
 数据基准由仓库中的 CSV 与现有 `load_csv()`、`dataset_info()`、`describe_numeric()`、`correlation()`、`group_aggregate()` 核对。`data/mock_sales.csv` 的列名、数值不同，不能替代 `data/samples/sales.csv`。
@@ -73,7 +74,7 @@ North,-5
 | North | 0 | 2 |
 | `null`（缺失的地区键） | 20 | 1 |
 
-**关键语义**：West 组目标列全部缺失，`sum(min_count=1)` 返回 **`null`**；North 组有两条有效数值 5、−5，和为真实 **0**。`count` 计算的是 `sales` **非缺失值数量**，不是每组的总行数。`region` 为缺失值时仍保留单独一组，报告 JSON 中的分组键为 `null`，不是字符串 `"null"`。
+**关键语义**：West 组目标列全部缺失，`sum(min_count=1)` 返回 **`null`**；North 组的模拟 CSV 中有两条有效数值 5、−5，和为真实 **0**。但模型仅看到分组汇总时，**不要求它说出 5、−5 两个具体值**；能够说明“两条有效销售额记录相加为零”即可。`count` 计算的是 `sales` **非缺失值数量**，不是每组的总行数。`region` 为缺失值时仍保留单独一组，报告 JSON 中的分组键为 `null`，不是字符串 `"null"`。
 
 ## 自动检查的规则
 
@@ -126,7 +127,38 @@ python -m examples.run_evaluation
 - 分组缺失案例是否正确区分 West 的**全缺失总和 `null`**、North 的**真实总和 0**，以及缺失地区键对应的分组；是否正确解释 `count`。
 - 是否将描述性组间差异不恰当地解释为因果关系，或编造 p 值、置信区间，或出现 `"(!256)"` 一类无意义内容。
 
-当前没有模型裁判、并发评估或自动重试；人工审核状态需由审查者另行记录，脚本不会自动判定回答通过。
+### 逐案例记录审核结论（任务 23）
+
+对已有的 JSON 报告执行以下命令。此操作**只读输入报告，不读取模型配置、不发送 API 请求、不会重新运行任何分析**：
+
+```powershell
+python -m examples.review_evaluation --report evals/reports/evaluation_原始时间戳.json --case region_mean --status passed --note "均值正确，保留缺失地区组，未作因果解释"
+```
+
+命令打印一个新的 `evals/reports/review_*.json` 路径和审核汇总。审核另一个案例时，**将上一步生成的新报告路径作为 `--report` 输入**，之前已经审核过的案例会保留其 `status`、`note` 和 `reviewed_at`：
+
+```powershell
+python -m examples.review_evaluation --report evals/reports/review_上一步文件名.json --case group_missing_sum_count --status passed --note "West 全缺失返回 null；North 两条有效值之和为 0；保留缺失地区组"
+```
+
+`--status` 仅允许 `passed` 或 `failed`；`--note` 必须包含非空白内容。每次操作都要求案例 ID **恰好出现一次**；未知或重复 ID 会明确报错，且不会生成新报告。不能覆盖输入报告或已存在的报告文件。
+
+审核后，该案例的 `human_review` **保留原来的 `criteria`**，并新增或更新：
+
+```json
+{
+  "status": "passed",
+  "criteria": ["原报告中定义的审核标准……"],
+  "note": "均值正确，保留缺失地区组，未作因果解释",
+  "reviewed_at": "2026-10-26T12:00:00Z"
+}
+```
+
+`reviewed_at` 为实际执行审核时的 UTC 时间，上面仅为格式示例。报告 `summary` 增加并更新 `human_review_passed`、`human_review_failed`、`human_review_pending`，三者之和等于案例数。**原有 `passed`、`failed` 只反映自动工具检查结果，不会因人工审核的结论而改变**。自动检查通过不代表人工通过，反之亦然；人工决定 `--status`，脚本不会根据自动检查替审核者做判断。
+
+North 的审核重点是识别真实总和 0 与 West 全缺失 `null` 的区别，**无须在没有原始值或相应工具支持时复述 5 与 −5**。工具只给出 `sum` 和 `count` 时，不应臆造个体记录值。
+
+当前没有模型裁判、并发评估或自动重试；审核结论由人工输入，不自动判定回答质量。
 
 ## 局限性
 
